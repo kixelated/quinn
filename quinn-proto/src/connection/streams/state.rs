@@ -2041,13 +2041,9 @@ mod tests {
             assert!(chunks.next(1).unwrap().is_none());
             let _ = chunks.finalize();
         }
-        // After churning through N streams, only freshly-closed tombstones should remain
-        // — certainly nothing on the order of N.
-        assert!(
-            client.recv.len() < 16,
-            "recv.len() = {} grew with churn",
-            client.recv.len()
-        );
+        // Every stream was fully drained; the map must be empty.
+        assert_eq!(client.recv.len(), 0);
+        assert_eq!(client.send.len(), 0);
     }
 
     #[test]
