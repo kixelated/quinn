@@ -151,7 +151,7 @@ impl StreamsState {
         receive_window: VarInt,
         stream_receive_window: VarInt,
     ) -> Self {
-        let mut this = Self {
+        Self {
             side,
             send: FxHashMap::default(),
             recv: FxHashMap::default(),
@@ -184,15 +184,7 @@ impl StreamsState {
             initial_max_stream_data_bidi_remote: 0u32.into(),
             receive_window_shrink_debt: 0,
             streams_blocked: [false, false],
-        };
-
-        for dir in Dir::iter() {
-            for i in 0..this.max_remote[dir as usize] {
-                this.insert(true, StreamId::new(!side, dir, i));
-            }
         }
-
-        this
     }
 
     pub(crate) fn set_params(&mut self, params: &TransportParameters) {
@@ -202,10 +194,11 @@ impl StreamsState {
         self.max[Dir::Bi as usize] = params.initial_max_streams_bidi.into();
         self.max[Dir::Uni as usize] = params.initial_max_streams_uni.into();
         self.received_max_data(params.initial_max_data);
-        for i in 0..self.max_remote[Dir::Bi as usize] {
-            let id = StreamId::new(!self.side, Dir::Bi, i);
-            if let Some(s) = self.send.get_mut(&id).and_then(|s| s.as_mut()) {
-                s.max_data = params.initial_max_stream_data_bidi_local.into();
+        for (&id, slot) in self.send.iter_mut() {
+            if id.initiator() != self.side && id.dir() == Dir::Bi {
+                if let Some(s) = slot.as_mut() {
+                    s.max_data = params.initial_max_stream_data_bidi_local.into();
+                }
             }
         }
     }
@@ -215,10 +208,6 @@ impl StreamsState {
     fn ensure_remote_streams(&mut self, dir: Dir) {
         let new_count = self.max_concurrent_remote_count[dir as usize]
             .saturating_sub(self.allocated_remote_count[dir as usize]);
-        for i in 0..new_count {
-            let id = StreamId::new(!self.side, dir, self.max_remote[dir as usize] + i);
-            self.insert(true, id);
-        }
         self.allocated_remote_count[dir as usize] += new_count;
         self.max_remote[dir as usize] += new_count;
     }
@@ -263,6 +252,8 @@ impl StreamsState {
             debug!("received illegal STREAM frame");
         })?;
 
+        self.insert_remote(id);
+
         let Some(rs) = self
             .recv
             .get_mut(&id)
@@ -282,7 +273,7 @@ impl StreamsState {
         self.data_recvd = self.data_recvd.saturating_add(new_bytes);
 
         if !rs.stopped {
-            self.on_stream_frame(true, id);
+            self.events.push_back(StreamEvent::Readable { id });
             return Ok(ShouldTransmit(false));
         }
 
@@ -313,6 +304,8 @@ impl StreamsState {
             debug!("received illegal RESET_STREAM frame");
         })?;
 
+        self.insert_remote(id);
+
         let Some(rs) = self
             .recv
             .get_mut(&id)
@@ -339,8 +332,9 @@ impl StreamsState {
             // Stopped streams should be disposed immediately on reset
             let rs = self.recv.remove(&id).flatten().unwrap();
             self.stream_recv_freed(id, rs);
+        } else {
+            self.events.push_back(StreamEvent::Readable { id });
         }
-        self.on_stream_frame(!stopped, id);
 
         // Update connection-level flow control
         Ok(if bytes_read != final_offset.into_inner() {
@@ -357,6 +351,8 @@ impl StreamsState {
     /// Process incoming `STOP_SENDING` frame
     #[allow(unreachable_pub)] // fuzzing only
     pub fn received_stop_sending(&mut self, id: StreamId, error_code: VarInt) {
+        self.insert_remote(id);
+
         let max_send_data = self.max_send_data(id);
         let Some(stream) = self
             .send
@@ -369,7 +365,6 @@ impl StreamsState {
         if stream.try_stop(error_code) {
             self.events
                 .push_back(StreamEvent::Stopped { id, error_code });
-            self.on_stream_frame(false, id);
         }
     }
 
@@ -632,24 +627,6 @@ impl StreamsState {
         stream_frames
     }
 
-    /// Notify the application that new streams were opened or a stream became readable.
-    fn on_stream_frame(&mut self, notify_readable: bool, stream: StreamId) {
-        if stream.initiator() == self.side {
-            // Notifying about the opening of locally-initiated streams would be redundant.
-            if notify_readable {
-                self.events.push_back(StreamEvent::Readable { id: stream });
-            }
-            return;
-        }
-        let next = &mut self.next_remote[stream.dir() as usize];
-        if stream.index() >= *next {
-            *next = stream.index() + 1;
-            self.opened[stream.dir() as usize] = true;
-        } else if notify_readable {
-            self.events.push_back(StreamEvent::Readable { id: stream });
-        }
-    }
-
     pub(crate) fn received_ack_of(&mut self, frame: frame::StreamMeta) {
         let mut entry = match self.send.entry(frame.id) {
             hash_map::Entry::Vacant(_) => return,
@@ -750,6 +727,8 @@ impl StreamsState {
             ));
         }
 
+        self.insert_remote(id);
+
         let write_limit = self.write_limit();
         let max_send_data = self.max_send_data(id);
         if let Some(ss) = self
@@ -775,7 +754,6 @@ impl StreamsState {
             ));
         }
 
-        self.on_stream_frame(false, id);
         Ok(())
     }
 
@@ -892,17 +870,46 @@ impl StreamsState {
         expanded
     }
 
-    pub(super) fn insert(&mut self, remote: bool, id: StreamId) {
-        let bi = id.dir() == Dir::Bi;
-        // bidirectional OR (unidirectional AND NOT remote)
-        if bi || !remote {
-            assert!(self.send.insert(id, None).is_none());
-        }
-        // bidirectional OR (unidirectional AND remote)
-        if bi || remote {
+    /// Insert `(id, None)` tombstones for a locally-initiated stream into `send` (and `recv`
+    /// for bidi). Called from `Streams::open`; the caller guarantees the id is fresh.
+    pub(super) fn insert_local(&mut self, id: StreamId) {
+        debug_assert_eq!(id.initiator(), self.side);
+        assert!(self.send.insert(id, None).is_none());
+        if id.dir() == Dir::Bi {
             let recv = self.free_recv.pop();
             assert!(self.recv.insert(id, recv).is_none());
         }
+    }
+
+    /// Advance the `next_remote` frontier to cover `id` and insert `(tid, None)` tombstones
+    /// for every index skipped along the way.
+    ///
+    /// Called at the top of each remote receive path. RFC 9000 §3.2 says receiving a frame
+    /// for index N implicitly opens indices `0..N` of the same type, so we must materialize
+    /// tombstones for the skipped indices — otherwise a later out-of-order frame for one of
+    /// them would land on "absent from map" and get dropped as closed. Out-of-range or
+    /// below-frontier ids are no-ops; callers that need to reject out-of-range ids should
+    /// run `validate_receive_id` first.
+    fn insert_remote(&mut self, id: StreamId) {
+        let dir = id.dir();
+        let dir_idx = dir as usize;
+        if id.initiator() == self.side
+            || id.index() >= self.max_remote[dir_idx]
+            || id.index() < self.next_remote[dir_idx]
+        {
+            return;
+        }
+        let bi = dir == Dir::Bi;
+        for i in self.next_remote[dir_idx]..=id.index() {
+            let tid = StreamId::new(!self.side, dir, i);
+            let recv = self.free_recv.pop();
+            assert!(self.recv.insert(tid, recv).is_none());
+            if bi {
+                assert!(self.send.insert(tid, None).is_none());
+            }
+        }
+        self.next_remote[dir_idx] = id.index() + 1;
+        self.opened[dir_idx] = true;
     }
 
     /// Adds credits to the connection flow control window
@@ -1880,10 +1887,167 @@ mod tests {
         for _ in 0..2 {
             client.set_max_concurrent(Dir::Uni, 200u32.into());
             client.set_max_concurrent(Dir::Bi, 201u32.into());
-            assert_eq!(client.recv.len(), 200 + 201);
             assert_eq!(client.max_remote[Dir::Uni as usize], 200);
             assert_eq!(client.max_remote[Dir::Bi as usize], 201);
+            assert_eq!(client.allocated_remote_count[Dir::Uni as usize], 200);
+            assert_eq!(client.allocated_remote_count[Dir::Bi as usize], 201);
+            // Slots are materialized lazily: no remote stream has been touched yet.
+            assert!(client.recv.is_empty());
+            assert!(client.send.is_empty());
         }
+    }
+
+    #[test]
+    fn lazy_remote_allocation_starts_empty() {
+        // `StreamsState::new` must not pre-populate `send`/`recv` with placeholder slots.
+        let client = StreamsState::new(
+            Side::Client,
+            10_000u32.into(),
+            10_000u32.into(),
+            1024 * 1024,
+            (1024 * 1024u32).into(),
+            (1024 * 1024u32).into(),
+        );
+        assert!(client.recv.is_empty());
+        assert!(client.send.is_empty());
+        assert_eq!(client.recv.capacity(), 0);
+        assert_eq!(client.send.capacity(), 0);
+    }
+
+    #[test]
+    fn out_of_order_implicit_open() {
+        // RFC 9000 §3.2: receiving idx=5 implicitly opens idx 0..=4. A subsequent frame for
+        // idx=3 must be processed normally, not dropped as "closed".
+        let mut client = make(Side::Client);
+        assert_eq!(
+            client.received(
+                frame::Stream {
+                    id: StreamId::new(Side::Server, Dir::Uni, 5),
+                    offset: 0,
+                    fin: true,
+                    data: Bytes::from_static(&[0; 8]),
+                },
+                8,
+            ),
+            Ok(ShouldTransmit(false))
+        );
+        // Frontier now spans 0..=5; tombstones for 0..=4 must exist so the late-arriving
+        // frame for idx=3 lands on live state instead of being silently dropped.
+        assert_eq!(client.next_remote[Dir::Uni as usize], 6);
+        assert_eq!(
+            client.received(
+                frame::Stream {
+                    id: StreamId::new(Side::Server, Dir::Uni, 3),
+                    offset: 0,
+                    fin: true,
+                    data: Bytes::from_static(&[0; 4]),
+                },
+                4,
+            ),
+            Ok(ShouldTransmit(false))
+        );
+        // Verify the data actually landed on stream 3.
+        let id = StreamId::new(Side::Server, Dir::Uni, 3);
+        let mut pending = Retransmits::default();
+        let mut recv = RecvStream {
+            id,
+            state: &mut client,
+            pending: &mut pending,
+        };
+        let mut chunks = recv.read(true).unwrap();
+        assert_eq!(chunks.next(4).unwrap().unwrap().bytes.len(), 4);
+        let _ = chunks.finalize();
+    }
+
+    #[test]
+    fn frame_for_closed_stream_is_dropped() {
+        // After a remote stream is fully freed, a subsequent frame for the same id must be
+        // dropped — absence from the map unambiguously means "closed" for ids below the
+        // frontier.
+        let mut client = make(Side::Client);
+        let id = StreamId::new(Side::Server, Dir::Uni, 0);
+        assert_eq!(
+            client.received(
+                frame::Stream {
+                    id,
+                    offset: 0,
+                    fin: true,
+                    data: Bytes::from_static(&[0; 4]),
+                },
+                4,
+            ),
+            Ok(ShouldTransmit(false))
+        );
+        // Drain the stream so it's fully freed.
+        let mut pending = Retransmits::default();
+        let mut recv = RecvStream {
+            id,
+            state: &mut client,
+            pending: &mut pending,
+        };
+        let mut chunks = recv.read(true).unwrap();
+        assert_eq!(chunks.next(4).unwrap().unwrap().bytes.len(), 4);
+        assert!(chunks.next(4).unwrap().is_none());
+        let _ = chunks.finalize();
+        assert!(!client.recv.contains_key(&id));
+
+        // A stray retransmit for the freed stream must be dropped without resurrecting state.
+        assert_eq!(
+            client.received(
+                frame::Stream {
+                    id,
+                    offset: 0,
+                    fin: true,
+                    data: Bytes::from_static(&[0; 4]),
+                },
+                4,
+            ),
+            Ok(ShouldTransmit(false))
+        );
+        assert!(!client.recv.contains_key(&id));
+    }
+
+    #[test]
+    fn churn_keeps_maps_bounded() {
+        // Rapidly open + fully close a long sequence of remote streams. The maps must stay
+        // bounded (only active streams are materialized) even though thousands of ids have
+        // been used over the connection's lifetime.
+        let mut client = make(Side::Client);
+        const N: u64 = 5_000;
+        for i in 0..N {
+            // Give ourselves room as we churn through ids.
+            client.set_max_concurrent(Dir::Uni, (i + 200).try_into().unwrap());
+            let id = StreamId::new(Side::Server, Dir::Uni, i);
+            assert_eq!(
+                client.received(
+                    frame::Stream {
+                        id,
+                        offset: 0,
+                        fin: true,
+                        data: Bytes::from_static(&[0; 1]),
+                    },
+                    1,
+                ),
+                Ok(ShouldTransmit(false))
+            );
+            let mut pending = Retransmits::default();
+            let mut recv = RecvStream {
+                id,
+                state: &mut client,
+                pending: &mut pending,
+            };
+            let mut chunks = recv.read(true).unwrap();
+            let _ = chunks.next(1).unwrap();
+            assert!(chunks.next(1).unwrap().is_none());
+            let _ = chunks.finalize();
+        }
+        // After churning through N streams, only freshly-closed tombstones should remain
+        // — certainly nothing on the order of N.
+        assert!(
+            client.recv.len() < 16,
+            "recv.len() = {} grew with churn",
+            client.recv.len()
+        );
     }
 
     #[test]
