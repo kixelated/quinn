@@ -252,6 +252,7 @@ impl StreamsState {
             debug!("received illegal STREAM frame");
         })?;
 
+        // Create state for this stream if the remote peer created it.
         self.insert_remote(id);
 
         let Some(rs) = self
@@ -304,6 +305,7 @@ impl StreamsState {
             debug!("received illegal RESET_STREAM frame");
         })?;
 
+        // Create state for this stream if the remote peer created it.
         self.insert_remote(id);
 
         let Some(rs) = self
@@ -351,6 +353,7 @@ impl StreamsState {
     /// Process incoming `STOP_SENDING` frame
     #[allow(unreachable_pub)] // fuzzing only
     pub fn received_stop_sending(&mut self, id: StreamId, error_code: VarInt) {
+        // Create state for this stream if the remote peer created it.
         self.insert_remote(id);
 
         let max_send_data = self.max_send_data(id);
@@ -727,6 +730,7 @@ impl StreamsState {
             ));
         }
 
+        // Create state for this stream if the remote peer created it.
         self.insert_remote(id);
 
         let write_limit = self.write_limit();
@@ -887,24 +891,27 @@ impl StreamsState {
     /// Called at the top of each remote receive path. RFC 9000 §3.2 says receiving a frame
     /// for index N implicitly opens indices `0..N` of the same type, so we must materialize
     /// tombstones for the skipped indices — otherwise a later out-of-order frame for one of
-    /// them would land on "absent from map" and get dropped as closed. Out-of-range or
-    /// below-frontier ids are no-ops; callers that need to reject out-of-range ids should
-    /// run `validate_receive_id` first.
+    /// them would land on "absent from map" and get dropped as closed.
     fn insert_remote(&mut self, id: StreamId) {
-        let dir = id.dir();
-        let dir_idx = dir as usize;
+        let dir_idx = id.dir() as usize;
+
+        // If we initiated this stream, nothing to do
         if id.initiator() == self.side
+            // If this stream is larger than the max allowed, return.
+            // NOTE: STREAM/RESET_STREAM already enforces this, however STOP_SENDING/MAX_STREAM_DATA do not
             || id.index() >= self.max_remote[dir_idx]
+            // If this stream has already been opened, nothing to do
             || id.index() < self.next_remote[dir_idx]
         {
             return;
         }
-        let bi = dir == Dir::Bi;
+
+        // Create all of the streams between the largest opened and this stream.
         for i in self.next_remote[dir_idx]..=id.index() {
-            let tid = StreamId::new(!self.side, dir, i);
+            let tid = StreamId::new(!self.side, id.dir(), i);
             let recv = self.free_recv.pop();
             assert!(self.recv.insert(tid, recv).is_none());
-            if bi {
+            if id.dir() == Dir::Bi {
                 assert!(self.send.insert(tid, None).is_none());
             }
         }
