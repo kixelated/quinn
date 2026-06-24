@@ -404,13 +404,37 @@ fn max_batch_bytes(max_gso_segments: usize, segment_size: usize, destination: So
     max_payload.min(max_gso_segments * segment_size)
 }
 
+/// Number of bytes to send in the next `sendmsg`, given `remaining` bytes left
+/// in the transmit and a per-call budget of `max_bytes`.
+///
+/// `max_batch_bytes` can land mid-segment (the `u16::MAX` byte cap is rarely a
+/// multiple of `segment_size`). But the kernel segments a GSO buffer purely by
+/// byte offset — every `segment_size` bytes — with no knowledge of intended
+/// datagram boundaries. So an *intermediate* batch must stop on a segment
+/// boundary; otherwise the split emits a short datagram in the middle of the
+/// stream and shifts every segment after it. Only the genuine final batch (the
+/// remainder of the whole transmit) may carry a partial last segment.
+#[cfg(any(not(any(apple, target_os = "openbsd", target_os = "netbsd")), test))]
+fn next_batch_bytes(remaining: usize, max_bytes: usize, segment_size: usize) -> usize {
+    if remaining <= max_bytes {
+        // Final batch: send what's left, partial last segment and all.
+        remaining
+    } else {
+        // Intermediate batch: round the byte budget down to whole segments, but
+        // always make progress even if a single segment exceeds the budget.
+        (max_bytes / segment_size).max(1) * segment_size
+    }
+}
+
 /// Send a `Transmit` as one or more `sendmsg` calls.
 ///
 /// Each iteration packs up to `max_bytes` bytes (chosen so that both the
 /// kernel byte limit and the runtime GSO segment budget are respected) into
-/// one syscall. `prepare_msg` re-checks `effective_segment_size` per batch
-/// and elides `UDP_SEGMENT` when the batch holds one segment or less, so the
-/// partial-last-batch and no-GSO cases fall out automatically.
+/// one syscall, rounded down to a segment boundary by [`next_batch_bytes`] so
+/// intermediate batches never split a segment. `prepare_msg` re-checks
+/// `effective_segment_size` per batch and elides `UDP_SEGMENT` when the batch
+/// holds one segment or less, so the partial-last-batch and no-GSO cases fall
+/// out automatically.
 ///
 /// If a multi-segment batch fails with `EIO`/`EINVAL` (common on Android
 /// cellular: the kernel reports GSO support but the radio driver rejects the
@@ -424,7 +448,8 @@ fn send(state: &UdpSocketState, io: SockRef<'_>, transmit: &Transmit<'_>) -> io:
 
     let mut pos = 0;
     while pos < transmit.contents.len() {
-        let batch_end = (pos + max_bytes).min(transmit.contents.len());
+        let remaining = transmit.contents.len() - pos;
+        let batch_end = pos + next_batch_bytes(remaining, max_bytes, segment_size);
         let batch = Transmit {
             destination: transmit.destination,
             ecn: transmit.ecn,
@@ -1372,5 +1397,63 @@ mod tests {
         assert_eq!(max, 65487);
         // 51 * 1280 + 207 = 65487 — fits in one batch.
         assert!(51 * 1280 + 207 <= max);
+    }
+
+    #[test]
+    fn next_batch_bytes_final_batch_keeps_partial() {
+        // Everything left fits in the budget: send it all, partial tail and all.
+        assert_eq!(next_batch_bytes(65487, 65487, 1280), 65487);
+        assert_eq!(next_batch_bytes(500, 65487, 1280), 500);
+    }
+
+    #[test]
+    fn next_batch_bytes_intermediate_is_segment_aligned() {
+        // A transmit larger than the byte cap must be split *on a segment
+        // boundary*, not at the raw byte cap (which would emit a runt mid-stream).
+        let max = max_batch_bytes(64, 1280, v6_dest()); // 65487, not a multiple of 1280
+        let batch = next_batch_bytes(81920, max, 1280); // 64 * 1280 = 81920
+        assert_eq!(batch, 51 * 1280, "must round 65487 down to 51 whole segments");
+        assert_eq!(batch % 1280, 0, "intermediate batch must be segment-aligned");
+        // The remainder then rides in a second, also-aligned batch.
+        assert_eq!(81920 - batch, 13 * 1280);
+    }
+
+    #[test]
+    fn next_batch_bytes_always_progresses() {
+        // Even if a single segment exceeds the byte budget, send one segment so
+        // the loop can't spin forever (the oversized datagram then fails loudly).
+        assert_eq!(next_batch_bytes(10_000, 1000, 1500), 1500);
+    }
+
+    #[test]
+    fn next_batch_bytes_single_segment_after_gso_halt() {
+        // After a GSO halt the budget drops to one segment; every batch is then
+        // exactly one datagram.
+        assert_eq!(next_batch_bytes(81920, 1280, 1280), 1280);
+    }
+
+    /// Walks the whole slicing loop over an oversized transmit and asserts every
+    /// emitted batch is segment-aligned except the final remainder — the
+    /// property the integration test verifies against a real kernel.
+    #[test]
+    fn slicing_preserves_segment_alignment() {
+        const SEGMENT: usize = 1280;
+        let total = 100 * SEGMENT + 333; // 100 full segments + a real partial tail
+        let max = max_batch_bytes(64, SEGMENT, v6_dest());
+
+        let mut pos = 0;
+        let mut batches = 0;
+        while pos < total {
+            let remaining = total - pos;
+            let len = next_batch_bytes(remaining, max, SEGMENT);
+            assert!(len > 0);
+            if remaining > max {
+                assert_eq!(len % SEGMENT, 0, "intermediate batch split a segment");
+            }
+            pos += len;
+            batches += 1;
+        }
+        assert_eq!(pos, total, "slicing must cover exactly the whole transmit");
+        assert!(batches >= 2, "this transmit should require multiple syscalls");
     }
 }
