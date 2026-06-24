@@ -197,12 +197,7 @@ impl UdpSocketState {
     /// If you would like to handle these errors yourself, use [`UdpSocketState::try_send`]
     /// instead.
     pub fn send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
-        match send(
-            socket,
-            transmit,
-            self.ecn_v4_supported,
-            self.ecn_v6_supported,
-        ) {
+        match crate::send_sliced(self, socket, transmit) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
             Err(e) => {
@@ -215,12 +210,32 @@ impl UdpSocketState {
 
     /// Sends a [`Transmit`] on the given socket without any additional error handling.
     pub fn try_send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
+        crate::send_sliced(self, socket, transmit)
+    }
+
+    /// Send a single batch (one `WSASendMsg` call) of a [`Transmit`].
+    ///
+    /// [`crate::send_sliced`] guarantees `transmit` fits in one syscall.
+    pub(crate) fn send_batch(
+        &self,
+        socket: &UdpSockRef<'_>,
+        transmit: &Transmit<'_>,
+    ) -> io::Result<()> {
+        // `SockRef` isn't `Copy`; re-borrow the underlying socket (`Socket` is
+        // `AsSocket`). The `From` impl lives in this `cfg(windows)` module.
+        let socket = UdpSockRef(socket2::SockRef::from(&*socket.0));
         send(
             socket,
             transmit,
             self.ecn_v4_supported,
             self.ecn_v6_supported,
         )
+    }
+
+    /// Windows performs USO in-kernel and has no Android-style radio halt, so a
+    /// failed send is never re-batched as single segments.
+    pub(crate) fn try_halt_gso(&self, _e: &io::Error) -> bool {
+        false
     }
 
     pub fn recv(

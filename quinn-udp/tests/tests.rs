@@ -537,6 +537,75 @@ fn apple_fast_datapath() {
     assert_eq!(total_received, segments, "should receive all segments");
 }
 
+/// A `Transmit` carrying more than `BATCH_SIZE` segments must be sliced across
+/// multiple `sendmsg_x` calls. Before the slicing was hoisted above the
+/// backends, the Apple fast path silently truncated such a transmit to the first
+/// `BATCH_SIZE` segments (`.take(BATCH_SIZE)`) — or panicked in debug via the
+/// `debug_assert!`. This sends 3x the batch size and asserts every datagram
+/// arrives intact.
+#[test]
+#[cfg(apple_fast)]
+fn apple_fast_oversized_is_sliced() {
+    let send = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let recv = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let dst_addr = recv.local_addr().unwrap();
+
+    let send_state = UdpSocketState::new((&send).into()).unwrap();
+    let recv_state = UdpSocketState::new((&recv).into()).unwrap();
+    // SAFETY: assume sendmsg_x/recvmsg_x are available on the macOS test host.
+    unsafe {
+        send_state.set_apple_fast_path();
+        recv_state.set_apple_fast_path();
+    }
+    recv.set_nonblocking(false).unwrap();
+
+    const SEGMENT_SIZE: usize = 128;
+    // More than one `sendmsg_x` batch worth of segments.
+    let segments = send_state.max_gso_segments() * 3;
+    // Distinct byte per segment so a dropped/misordered datagram fails the compare.
+    let msg: Vec<u8> = (0..segments * SEGMENT_SIZE)
+        .map(|i| (i / SEGMENT_SIZE) as u8)
+        .collect();
+
+    send_state
+        .try_send(
+            (&send).into(),
+            &Transmit {
+                destination: dst_addr,
+                ecn: None,
+                contents: &msg,
+                segment_size: Some(SEGMENT_SIZE),
+                src_ip: None,
+            },
+        )
+        .unwrap();
+
+    let mut buf = [0u8; u16::MAX as usize];
+    let mut total_received = 0;
+    while total_received < segments {
+        let mut meta = RecvMeta::default();
+        let n = recv_state
+            .recv(
+                (&recv).into(),
+                &mut [IoSliceMut::new(&mut buf)],
+                slice::from_mut(&mut meta),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        let received_segments = meta.len / meta.stride;
+        for i in 0..received_segments {
+            assert_eq!(
+                &buf[i * meta.stride..(i + 1) * meta.stride],
+                &msg[(total_received + i) * SEGMENT_SIZE..(total_received + i + 1) * SEGMENT_SIZE],
+                "segment {} content mismatch",
+                total_received + i
+            );
+        }
+        total_received += received_segments;
+    }
+    assert_eq!(total_received, segments, "every segment must arrive");
+}
+
 #[test]
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn recv_transport_error() {

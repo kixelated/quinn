@@ -36,7 +36,7 @@ impl UdpSocketState {
     /// If you would like to handle these errors yourself, use [`UdpSocketState::try_send`]
     /// instead.
     pub fn send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
-        match send(socket, transmit) {
+        match crate::send_sliced(self, socket, transmit) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
             Err(e) => {
@@ -49,7 +49,26 @@ impl UdpSocketState {
 
     /// Sends a [`Transmit`] on the given socket without any additional error handling.
     pub fn try_send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
-        send(socket, transmit)
+        crate::send_sliced(self, socket, transmit)
+    }
+
+    /// Send a single batch of a [`Transmit`]. This path has no GSO
+    /// (`max_gso_segments == 1`), so [`crate::send_sliced`] only ever hands one
+    /// datagram at a time.
+    pub(crate) fn send_batch(
+        &self,
+        socket: &UdpSockRef<'_>,
+        transmit: &Transmit<'_>,
+    ) -> io::Result<()> {
+        socket
+            .0
+            .send_to(transmit.contents, &socket2::SockAddr::from(transmit.destination))?;
+        Ok(())
+    }
+
+    /// No GSO on this path, so a failed send is never re-batched.
+    pub(crate) fn try_halt_gso(&self, _e: &io::Error) -> bool {
+        false
     }
 
     pub fn recv(
@@ -115,13 +134,6 @@ impl UdpSocketState {
     pub fn may_fragment(&self) -> bool {
         true
     }
-}
-
-fn send(socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
-    socket.0.send_to(
-        transmit.contents,
-        &socket2::SockAddr::from(transmit.destination),
-    )
 }
 
 pub(crate) const BATCH_SIZE: usize = 1;
