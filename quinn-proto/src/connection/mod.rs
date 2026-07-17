@@ -15,9 +15,9 @@ use thiserror::Error;
 use tracing::{debug, error, trace, trace_span, warn};
 
 use crate::{
-    Dir, Duration, EndpointConfig, Frame, INITIAL_MTU, Instant, MAX_CID_SIZE, MAX_STREAM_COUNT,
-    MIN_INITIAL_SIZE, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit, TransportError,
-    TransportErrorCode, VarInt,
+    Dir, Duration, EndpointConfig, Frame, INITIAL_MTU, Instant, MAX_CID_SIZE, MIN_INITIAL_SIZE,
+    Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit, TransportError, TransportErrorCode,
+    VarInt,
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
     coding::BufMutExt,
@@ -34,15 +34,16 @@ use crate::{
         ConnectionEvent, ConnectionEventInner, ConnectionId, DatagramConnectionEvent, EcnCodepoint,
         EndpointEvent, EndpointEventInner,
     },
+    streams::{
+        Frame as StreamFrame, Parameters as StreamParameters, RecvStream, SendStream, StreamEvent,
+        Streams, StreamsState, WriteStats as StreamWriteStats,
+    },
     token::{ResetToken, Token, TokenPayload},
     transport_parameters::TransportParameters,
 };
 
 mod ack_frequency;
 use ack_frequency::AckFrequencyState;
-
-mod assembler;
-pub use assembler::Chunk;
 
 mod cid_state;
 use cid_state::CidState;
@@ -66,27 +67,12 @@ use paths::{PathData, PathResponses};
 
 pub(crate) mod qlog;
 
-mod send_buffer;
-
 mod spaces;
-#[cfg(fuzzing)]
-pub use spaces::Retransmits;
-#[cfg(not(fuzzing))]
 use spaces::Retransmits;
 use spaces::{PacketNumberFilter, PacketSpace, SendableFrames, SentPacket, ThinRetransmits};
 
 mod stats;
 pub use stats::{ConnectionStats, FrameStats, PathStats, UdpStats};
-
-mod streams;
-#[cfg(fuzzing)]
-pub use streams::StreamsState;
-#[cfg(not(fuzzing))]
-use streams::StreamsState;
-pub use streams::{
-    Chunks, ClosedStream, FinishError, ReadError, ReadableError, RecvStream, SendStream,
-    ShouldTransmit, StreamEvent, Streams, WriteError, Written,
-};
 
 mod timer;
 use crate::congestion::Controller;
@@ -413,7 +399,7 @@ impl Connection {
     pub fn streams(&mut self) -> Streams<'_> {
         Streams {
             state: &mut self.streams,
-            conn_state: &self.state,
+            closed: self.state.is_closed(),
         }
     }
 
@@ -424,7 +410,7 @@ impl Connection {
         RecvStream {
             id,
             state: &mut self.streams,
-            pending: &mut self.spaces[SpaceId::Data].pending,
+            pending: &mut self.spaces[SpaceId::Data].pending.streams,
         }
     }
 
@@ -435,8 +421,8 @@ impl Connection {
         SendStream {
             id,
             state: &mut self.streams,
-            pending: &mut self.spaces[SpaceId::Data].pending,
-            conn_state: &self.state,
+            pending: &mut self.spaces[SpaceId::Data].pending.streams,
+            closed: self.state.is_closed(),
         }
     }
 
@@ -1404,7 +1390,7 @@ impl Connection {
         // If the limit was reduced, then a flow control update previously deemed insignificant may
         // now be significant.
         let pending = &mut self.spaces[SpaceId::Data].pending;
-        self.streams.queue_max_stream_id(pending);
+        self.streams.queue_max_stream_id(&mut pending.streams);
     }
 
     /// Current number of remotely initiated streams that may be concurrently open
@@ -1424,7 +1410,7 @@ impl Connection {
     /// See [`TransportConfig::receive_window()`]
     pub fn set_receive_window(&mut self, receive_window: VarInt) {
         if self.streams.set_receive_window(receive_window) {
-            self.spaces[SpaceId::Data].pending.max_data = true;
+            self.spaces[SpaceId::Data].pending.streams.max_data = true;
         }
     }
 
@@ -1634,7 +1620,7 @@ impl Connection {
 
         // Update state for confirmed delivery of frames
         if let Some(retransmits) = info.retransmits.get() {
-            for (id, _) in retransmits.reset_stream.iter() {
+            for (id, _) in retransmits.streams.reset_stream.iter() {
                 self.streams.reset_acked(*id);
             }
         }
@@ -2824,9 +2810,16 @@ impl Connection {
                     self.read_crypto(SpaceId::Data, &frame, payload_len)?;
                 }
                 Frame::Stream(frame) => {
-                    if self.streams.received(frame, payload_len)?.should_transmit() {
-                        self.spaces[SpaceId::Data].pending.max_data = true;
-                    }
+                    self.streams.received_frame(
+                        StreamFrame::Stream {
+                            id: frame.id,
+                            offset: frame.offset,
+                            fin: frame.fin,
+                            data: frame.data,
+                        },
+                        payload_len,
+                        &mut self.spaces[SpaceId::Data].pending.streams,
+                    )?;
                 }
                 Frame::Ack(ack) => {
                     self.on_ack_received(now, SpaceId::Data, ack)?;
@@ -2861,59 +2854,73 @@ impl Connection {
                     }
                 }
                 Frame::MaxData(bytes) => {
-                    self.streams.received_max_data(bytes);
+                    self.streams.received_frame(
+                        StreamFrame::MaxData(bytes),
+                        0,
+                        &mut self.spaces[SpaceId::Data].pending.streams,
+                    )?;
                 }
                 Frame::MaxStreamData { id, offset } => {
-                    self.streams.received_max_stream_data(id, offset)?;
+                    self.streams.received_frame(
+                        StreamFrame::MaxStreamData { id, offset },
+                        0,
+                        &mut self.spaces[SpaceId::Data].pending.streams,
+                    )?;
                 }
                 Frame::MaxStreams { dir, count } => {
-                    self.streams.received_max_streams(dir, count)?;
+                    self.streams.received_frame(
+                        StreamFrame::MaxStreams { dir, count },
+                        0,
+                        &mut self.spaces[SpaceId::Data].pending.streams,
+                    )?;
                 }
                 Frame::ResetStream(frame) => {
-                    if self.streams.received_reset(frame)?.should_transmit() {
-                        self.spaces[SpaceId::Data].pending.max_data = true;
-                    }
+                    self.streams.received_frame(
+                        StreamFrame::Reset {
+                            id: frame.id,
+                            error_code: frame.error_code,
+                            final_offset: frame.final_offset,
+                        },
+                        0,
+                        &mut self.spaces[SpaceId::Data].pending.streams,
+                    )?;
                 }
                 Frame::DataBlocked { offset } => {
+                    self.streams.received_frame(
+                        StreamFrame::DataBlocked { offset },
+                        0,
+                        &mut self.spaces[SpaceId::Data].pending.streams,
+                    )?;
                     debug!(offset, "peer claims to be blocked at connection level");
                 }
                 Frame::StreamDataBlocked { id, offset } => {
-                    if id.initiator() == self.side.side() && id.dir() == Dir::Uni {
-                        debug!("got STREAM_DATA_BLOCKED on send-only {}", id);
-                        return Err(TransportError::STREAM_STATE_ERROR(
-                            "STREAM_DATA_BLOCKED on send-only stream",
-                        ));
-                    }
+                    self.streams.received_frame(
+                        StreamFrame::StreamDataBlocked { id, offset },
+                        0,
+                        &mut self.spaces[SpaceId::Data].pending.streams,
+                    )?;
                     debug!(
                         stream = %id,
                         offset, "peer claims to be blocked at stream level"
                     );
                 }
                 Frame::StreamsBlocked { dir, limit } => {
-                    if limit > MAX_STREAM_COUNT {
-                        return Err(TransportError::FRAME_ENCODING_ERROR(
-                            "unrepresentable stream limit",
-                        ));
-                    }
+                    self.streams.received_frame(
+                        StreamFrame::StreamsBlocked { dir, limit },
+                        0,
+                        &mut self.spaces[SpaceId::Data].pending.streams,
+                    )?;
                     debug!(
                         "peer claims to be blocked opening more than {} {} streams",
                         limit, dir
                     );
                 }
                 Frame::StopSending(frame::StopSending { id, error_code }) => {
-                    if id.initiator() != self.side.side() {
-                        if id.dir() == Dir::Uni {
-                            debug!("got STOP_SENDING on recv-only {}", id);
-                            return Err(TransportError::STREAM_STATE_ERROR(
-                                "STOP_SENDING on recv-only stream",
-                            ));
-                        }
-                    } else if self.streams.is_local_unopened(id) {
-                        return Err(TransportError::STREAM_STATE_ERROR(
-                            "STOP_SENDING on unopened stream",
-                        ));
-                    }
-                    self.streams.received_stop_sending(id, error_code);
+                    self.streams.received_frame(
+                        StreamFrame::StopSending { id, error_code },
+                        0,
+                        &mut self.spaces[SpaceId::Data].pending.streams,
+                    )?;
                 }
                 Frame::RetireConnectionId { sequence } => {
                     let allow_more_cids = self
@@ -3066,7 +3073,7 @@ impl Connection {
         // are only freed, and hence only issue credit, once the application has been notified
         // during a read on the stream.
         let pending = &mut self.spaces[SpaceId::Data].pending;
-        self.streams.queue_max_stream_id(pending);
+        self.streams.queue_max_stream_id(&mut pending.streams);
 
         if let Some(reason) = close {
             self.error = Some(reason.into());
@@ -3331,13 +3338,28 @@ impl Connection {
         }
 
         if space_id == SpaceId::Data {
+            let mut stream_stats = StreamWriteStats::default();
+            let mut stream_retransmits = crate::streams::Pending::default();
+            let stream_start = buf.len();
             self.streams.write_control_frames(
                 buf,
-                &mut space.pending,
-                &mut sent.retransmits,
-                &mut self.stats.frame_tx,
+                &mut space.pending.streams,
+                &mut stream_retransmits,
+                &mut stream_stats,
                 max_size,
             );
+            if buf.len() != stream_start {
+                sent.retransmits.get_or_create().streams |= stream_retransmits;
+            }
+            let stats = &mut self.stats.frame_tx;
+            stats.max_data += stream_stats.max_data;
+            stats.max_stream_data += stream_stats.max_stream_data;
+            stats.max_streams_bidi += stream_stats.max_streams_bidi;
+            stats.max_streams_uni += stream_stats.max_streams_uni;
+            stats.reset_stream += stream_stats.reset_stream;
+            stats.streams_blocked_bidi += stream_stats.streams_blocked_bidi;
+            stats.streams_blocked_uni += stream_stats.streams_blocked_uni;
+            stats.stop_sending += stream_stats.stop_sending;
         }
 
         // NEW_CONNECTION_ID
@@ -3509,7 +3531,14 @@ impl Connection {
     }
 
     fn set_peer_params(&mut self, params: TransportParameters) {
-        self.streams.set_params(&params);
+        self.streams.set_stream_params(StreamParameters {
+            initial_max_data: params.initial_max_data,
+            initial_max_stream_data_bidi_local: params.initial_max_stream_data_bidi_local,
+            initial_max_stream_data_bidi_remote: params.initial_max_stream_data_bidi_remote,
+            initial_max_stream_data_uni: params.initial_max_stream_data_uni,
+            initial_max_streams_bidi: params.initial_max_streams_bidi,
+            initial_max_streams_uni: params.initial_max_streams_uni,
+        });
         self.idle_timeout =
             negotiate_max_idle_timeout(self.config.max_idle_timeout, Some(params.max_idle_timeout));
         trace!("negotiated max idle timeout {:?}", self.idle_timeout);
@@ -3959,9 +3988,8 @@ impl From<ConnectionError> for io::Error {
     }
 }
 
-#[allow(unreachable_pub)] // fuzzing only
 #[derive(Clone)]
-pub enum State {
+enum State {
     Handshake(state::Handshake),
     Established,
     Closed(state::Closed),

@@ -11,13 +11,13 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
 };
 
-use bytes::{Buf, BufMut};
+use bytes::{Buf, BufMut, Bytes};
 use rand::{Rng as _, RngCore, seq::SliceRandom as _};
 use thiserror::Error;
 
 use crate::{
     LOC_CID_COUNT, MAX_CID_SIZE, MAX_STREAM_COUNT, RESET_TOKEN_SIZE, ResetToken, Side,
-    TIMER_GRANULARITY, TransportError, VarInt,
+    TIMER_GRANULARITY, TransportError, VarInt, VarIntBoundsExceeded,
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
     coding::{BufExt, BufMutExt, UnexpectedEnd},
@@ -304,6 +304,78 @@ impl From<UnexpectedEnd> for Error {
     }
 }
 
+/// A decoded transport-parameter entry.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct Parameter {
+    /// Parameter identifier.
+    pub id: VarInt,
+    /// Opaque parameter value.
+    pub value: Bytes,
+}
+
+/// A zero-copy iterator over encoded transport parameters.
+pub struct ParameterIter {
+    input: Bytes,
+    failed: bool,
+}
+
+impl ParameterIter {
+    /// Construct an iterator over a transport-parameter block.
+    pub fn new(input: Bytes) -> Self {
+        Self {
+            input,
+            failed: false,
+        }
+    }
+}
+
+impl Iterator for ParameterIter {
+    type Item = Result<Parameter, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed || !self.input.has_remaining() {
+            return None;
+        }
+        let (id, len) = match read_parameter_header(&mut self.input) {
+            Ok(Some(header)) => header,
+            Ok(None) => return None,
+            Err(error) => {
+                self.failed = true;
+                return Some(Err(error));
+            }
+        };
+        Some(Ok(Parameter {
+            id,
+            value: self.input.split_to(len),
+        }))
+    }
+}
+
+fn read_parameter_header<R: Buf>(input: &mut R) -> Result<Option<(VarInt, usize)>, Error> {
+    if !input.has_remaining() {
+        return Ok(None);
+    }
+    let id = input.get::<VarInt>()?;
+    let len = input.get_var()?;
+    if len > input.remaining() as u64 {
+        return Err(Error::Malformed);
+    }
+    Ok(Some((id, len as usize)))
+}
+
+/// Encode one transport-parameter ID, length, and opaque value.
+pub fn write_parameter<W: BufMut>(
+    output: &mut W,
+    id: VarInt,
+    value: &[u8],
+) -> Result<(), VarIntBoundsExceeded> {
+    let len = VarInt::try_from(value.len())?;
+    output.write(id);
+    output.write(len);
+    output.put_slice(value);
+    Ok(())
+}
+
 impl TransportParameters {
     /// Encode `TransportParameters` into buffer
     pub fn write<W: BufMut>(&self, w: &mut W) {
@@ -423,13 +495,8 @@ impl TransportParameters {
         }
         let mut got = apply_params!(param_state);
 
-        while r.has_remaining() {
-            let id = r.get_var()?;
-            let len = r.get_var()?;
-            if (r.remaining() as u64) < len {
-                return Err(Error::Malformed);
-            }
-            let len = len as usize;
+        while let Some((id, len)) = read_parameter_header(r)? {
+            let id = id.into_inner();
             let Ok(id) = TransportParameterId::try_from(id) else {
                 // unknown transport parameters are ignored
                 r.advance(len);
@@ -748,6 +815,22 @@ mod test {
             TransportParameters::read(Side::Client, &mut buf.as_slice()).unwrap(),
             params
         );
+    }
+
+    #[test]
+    fn parameter_helpers_round_trip() {
+        let mut encoded = Vec::new();
+        write_parameter(&mut encoded, 0x20u32.into(), b"value").unwrap();
+
+        let mut parameters = ParameterIter::new(encoded.into());
+        assert_eq!(
+            parameters.next().unwrap().unwrap(),
+            Parameter {
+                id: VarInt::from_u32(0x20),
+                value: Bytes::from_static(b"value"),
+            }
+        );
+        assert!(parameters.next().is_none());
     }
 
     #[test]

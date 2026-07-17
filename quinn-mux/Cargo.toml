@@ -1,0 +1,18 @@
+[package]
+name = "quinn-mux"
+version = "0.1.0"
+description = "QMUX over reliable ordered transports using quinn-proto stream state"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["quic", "qmux", "multiplexing"]
+categories.workspace = true
+
+[dependencies]
+bytes.workspace = true
+quinn-proto = { path = "../quinn-proto", default-features = false }
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -5,9 +5,9 @@ use thiserror::Error;
 use tracing::debug;
 
 use super::state::get_or_insert_recv;
-use super::{ClosedStream, Retransmits, ShouldTransmit, StreamId, StreamsState};
-use crate::connection::assembler::{Assembler, Chunk, IllegalOrderedRead};
-use crate::connection::streams::state::StreamRecv;
+use super::{ClosedStream, Pending, ShouldTransmit, StreamId, StreamsState};
+use crate::streams::assembler::{Assembler, Chunk, IllegalOrderedRead};
+use crate::streams::state::StreamRecv;
 use crate::{TransportError, VarInt, frame};
 
 #[derive(Debug, Default)]
@@ -246,7 +246,7 @@ pub struct Chunks<'a> {
     id: StreamId,
     ordered: bool,
     streams: &'a mut StreamsState,
-    pending: &'a mut Retransmits,
+    pending: &'a mut Pending,
     state: ChunksState,
     read: u64,
 }
@@ -256,7 +256,7 @@ impl<'a> Chunks<'a> {
         id: StreamId,
         ordered: bool,
         streams: &'a mut StreamsState,
-        pending: &'a mut Retransmits,
+        pending: &'a mut Pending,
     ) -> Result<Self, ReadableError> {
         let mut entry = match streams.recv.entry(id) {
             Entry::Occupied(entry) => entry,

@@ -23,6 +23,10 @@ use arbitrary::Arbitrary;
 pub struct FrameType(u64);
 
 impl FrameType {
+    pub(crate) const fn from_varint(value: VarInt) -> Self {
+        Self(value.into_inner())
+    }
+
     fn stream(self) -> Option<StreamInfo> {
         if STREAM_TYS.contains(&self.0) {
             Some(StreamInfo(self.0 as u8))
@@ -36,6 +40,26 @@ impl FrameType {
         } else {
             None
         }
+    }
+
+    pub(crate) fn reliable(self) -> bool {
+        matches!(
+            self,
+            Self::PADDING
+                | Self::RESET_STREAM
+                | Self::STOP_SENDING
+                | Self::MAX_DATA
+                | Self::MAX_STREAM_DATA
+                | Self::MAX_STREAMS_BIDI
+                | Self::MAX_STREAMS_UNI
+                | Self::DATA_BLOCKED
+                | Self::STREAM_DATA_BLOCKED
+                | Self::STREAMS_BLOCKED_BIDI
+                | Self::STREAMS_BLOCKED_UNI
+                | Self::CONNECTION_CLOSE
+                | Self::APPLICATION_CLOSE
+        ) || self.stream().is_some()
+            || self.datagram().is_some()
     }
 }
 
@@ -575,6 +599,10 @@ impl Iter {
     fn try_next(&mut self) -> Result<Frame, IterErr> {
         let ty = self.bytes.get::<FrameType>()?;
         self.last_ty = Some(ty);
+        self.try_next_with_type(ty)
+    }
+
+    fn try_next_with_type(&mut self, ty: FrameType) -> Result<Frame, IterErr> {
         Ok(match ty {
             FrameType::PADDING => Frame::Padding,
             FrameType::RESET_STREAM => Frame::ResetStream(ResetStream {
@@ -725,6 +753,25 @@ impl Iter {
     fn take_remaining(&mut self) -> Bytes {
         mem::take(&mut self.bytes)
     }
+}
+
+pub(crate) fn decode_with_type(
+    ty: FrameType,
+    payload: &mut Bytes,
+) -> Result<Frame, TransportError> {
+    let mut decoder = Iter {
+        bytes: mem::take(payload),
+        last_ty: Some(ty),
+    };
+    let result = decoder
+        .try_next_with_type(ty)
+        .map_err(|error| InvalidFrame {
+            ty: Some(ty),
+            reason: error.reason(),
+        })
+        .map_err(TransportError::from);
+    *payload = decoder.bytes;
+    result
 }
 
 impl Iterator for Iter {

@@ -1040,6 +1040,7 @@ name = "fuzz"
 version = "0.1.0"
 dependencies = [
  "arbitrary",
+ "bytes",
  "libfuzzer-sys",
  "quinn-proto",
 ]
@@ -1954,6 +1955,15 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "web-time",
+]
+
+[[package]]
+name = "quinn-mux"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "quinn-proto",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

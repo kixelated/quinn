@@ -44,13 +44,22 @@ pub use bloom_token_log::BloomTokenLog;
 
 mod connection;
 pub use crate::connection::{
-    Chunk, Chunks, ClosedStream, Connection, ConnectionError, ConnectionStats, Datagrams, Event,
-    FinishError, FrameStats, PathStats, ReadError, ReadableError, RecvStream, RttEstimator,
-    SendDatagramError, SendStream, ShouldTransmit, StreamEvent, Streams, UdpStats, WriteError,
-    Written,
+    Connection, ConnectionError, ConnectionStats, Datagrams, Event, FrameStats, PathStats,
+    RttEstimator, SendDatagramError, UdpStats,
 };
+
+/// QUIC stream state and reliable-carrier integration.
+///
+/// The reliable-carrier types in this module allow protocols such as QMUX to
+/// reuse Quinn's stream lifecycle, flow control, buffering, and scheduling
+/// without using Quinn's packet, congestion-control, or loss-recovery APIs.
+pub mod streams;
 #[cfg(feature = "qlog")]
 pub use connection::qlog::QlogStream;
+pub use streams::{
+    Chunk, Chunks, ClosedStream, FinishError, ReadError, ReadableError, RecvStream, SendStream,
+    ShouldTransmit, StreamEvent, Streams, WriteError, Written,
+};
 
 #[cfg(feature = "rustls")]
 pub use rustls;
@@ -111,8 +120,6 @@ pub(crate) use web_time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(fuzzing)]
 pub mod fuzzing {
-    pub use crate::connection::{Retransmits, State as ConnectionState, StreamsState};
-    pub use crate::frame::ResetStream;
     pub use crate::packet::PartialDecode;
     pub use crate::transport_parameters::TransportParameters;
     pub use bytes::{BufMut, BytesMut};

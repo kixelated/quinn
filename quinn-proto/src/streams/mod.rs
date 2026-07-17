@@ -4,19 +4,30 @@ use std::{
 };
 
 use bytes::Bytes;
+use rustc_hash::FxHashSet;
 use thiserror::Error;
 use tracing::trace;
 
-use super::spaces::{Retransmits, ThinRetransmits};
+pub use crate::{Dir, Side, StreamId, VarInt};
 use crate::{
-    Dir, StreamId, VarInt,
-    connection::streams::state::{get_or_insert_recv, get_or_insert_send},
     frame,
+    streams::state::{get_or_insert_recv, get_or_insert_send},
 };
+
+mod assembler;
+pub(crate) use assembler::Assembler;
+pub use assembler::Chunk;
+
+mod send_buffer;
 
 mod recv;
 use recv::Recv;
 pub use recv::{Chunks, ReadError, ReadableError};
+
+mod reliable;
+pub use reliable::{Config, Connection, Frame, Parameters, Transmit};
+
+pub mod wire;
 
 mod send;
 pub(crate) use send::{ByteSlice, BytesArray};
@@ -24,27 +35,69 @@ use send::{BytesSource, Send, SendState};
 pub use send::{FinishError, WriteError, Written};
 
 mod state;
-#[allow(unreachable_pub)] // fuzzing only
-pub use state::StreamsState;
+pub(crate) use state::StreamsState;
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Pending {
+    pub(crate) max_data: bool,
+    pub(crate) max_stream_id: [bool; 2],
+    pub(crate) streams_blocked: [bool; 2],
+    pub(crate) reset_stream: Vec<(StreamId, VarInt)>,
+    pub(crate) stop_sending: Vec<frame::StopSending>,
+    pub(crate) max_stream_data: FxHashSet<StreamId>,
+}
+
+impl Pending {
+    pub(crate) fn is_empty(&self, streams: &StreamsState) -> bool {
+        !self.max_data
+            && !self.max_stream_id.into_iter().any(|x| x)
+            && !self.streams_blocked.into_iter().any(|x| x)
+            && self.reset_stream.is_empty()
+            && self.stop_sending.is_empty()
+            && self
+                .max_stream_data
+                .iter()
+                .all(|&id| !streams.can_send_flow_control(id))
+    }
+}
+
+impl std::ops::BitOrAssign for Pending {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.max_data |= rhs.max_data;
+        for dir in Dir::iter() {
+            self.max_stream_id[dir as usize] |= rhs.max_stream_id[dir as usize];
+            self.streams_blocked[dir as usize] |= rhs.streams_blocked[dir as usize];
+        }
+        self.reset_stream.extend_from_slice(&rhs.reset_stream);
+        self.stop_sending.extend_from_slice(&rhs.stop_sending);
+        self.max_stream_data.extend(&rhs.max_stream_data);
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct WriteStats {
+    pub(crate) max_data: u64,
+    pub(crate) max_stream_data: u64,
+    pub(crate) max_streams_bidi: u64,
+    pub(crate) max_streams_uni: u64,
+    pub(crate) reset_stream: u64,
+    pub(crate) streams_blocked_bidi: u64,
+    pub(crate) streams_blocked_uni: u64,
+    pub(crate) stop_sending: u64,
+}
 
 /// Access to streams
 pub struct Streams<'a> {
     pub(super) state: &'a mut StreamsState,
-    pub(super) conn_state: &'a super::State,
+    pub(super) closed: bool,
 }
 
-#[allow(clippy::needless_lifetimes)] // Needed for cfg(fuzzing)
-impl<'a> Streams<'a> {
-    #[cfg(fuzzing)]
-    pub fn new(state: &'a mut StreamsState, conn_state: &'a super::State) -> Self {
-        Self { state, conn_state }
-    }
-
+impl Streams<'_> {
     /// Open a single stream if possible
     ///
     /// Returns `None` if the streams in the given direction are currently exhausted.
     pub fn open(&mut self, dir: Dir) -> Option<StreamId> {
-        if self.conn_state.is_closed() {
+        if self.closed {
             return None;
         }
 
@@ -78,11 +131,6 @@ impl<'a> Streams<'a> {
         Some(StreamId::new(!self.state.side, dir, x))
     }
 
-    #[cfg(fuzzing)]
-    pub fn state(&mut self) -> &mut StreamsState {
-        self.state
-    }
-
     /// The number of streams that may have unacknowledged data.
     pub fn send_streams(&self) -> usize {
         self.state.send_streams
@@ -105,7 +153,7 @@ impl<'a> Streams<'a> {
 pub struct RecvStream<'a> {
     pub(super) id: StreamId,
     pub(super) state: &'a mut StreamsState,
-    pub(super) pending: &'a mut Retransmits,
+    pub(super) pending: &'a mut Pending,
 }
 
 impl RecvStream<'_> {
@@ -196,27 +244,11 @@ impl RecvStream<'_> {
 pub struct SendStream<'a> {
     pub(super) id: StreamId,
     pub(super) state: &'a mut StreamsState,
-    pub(super) pending: &'a mut Retransmits,
-    pub(super) conn_state: &'a super::State,
+    pub(super) pending: &'a mut Pending,
+    pub(super) closed: bool,
 }
 
-#[allow(clippy::needless_lifetimes)] // Needed for cfg(fuzzing)
-impl<'a> SendStream<'a> {
-    #[cfg(fuzzing)]
-    pub fn new(
-        id: StreamId,
-        state: &'a mut StreamsState,
-        pending: &'a mut Retransmits,
-        conn_state: &'a super::State,
-    ) -> Self {
-        Self {
-            id,
-            state,
-            pending,
-            conn_state,
-        }
-    }
-
+impl SendStream<'_> {
     /// Send data on the given stream
     ///
     /// Returns the number of bytes successfully written.
@@ -235,7 +267,7 @@ impl<'a> SendStream<'a> {
     }
 
     fn write_source<B: BytesSource>(&mut self, source: &mut B) -> Result<Written, WriteError> {
-        if self.conn_state.is_closed() {
+        if self.closed {
             trace!(%self.id, "write blocked; connection draining");
             return Err(WriteError::Blocked);
         }
@@ -495,6 +527,9 @@ pub enum StreamEvent {
         dir: Dir,
     },
 }
+
+/// Application-facing stream event.
+pub use StreamEvent as Event;
 
 /// Indicates whether a frame needs to be transmitted
 ///
