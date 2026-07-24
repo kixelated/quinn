@@ -212,10 +212,7 @@ impl Session {
     }
 
     /// Wait on the connection state until `f` produces an outcome
-    async fn wait_for<U>(
-        &self,
-        f: impl Fn(&mut proto::Connection) -> Option<U>,
-    ) -> U {
+    async fn wait_for<U>(&self, f: impl Fn(&mut proto::Connection) -> Option<U>) -> U {
         loop {
             let notified = {
                 let mut state = self.shared.lock();
@@ -646,7 +643,10 @@ where
             let state = shared.lock();
             (
                 state.conn.is_closed(),
-                state.conn.poll_timeout().map(tokio::time::Instant::from_std),
+                state
+                    .conn
+                    .poll_timeout()
+                    .map(tokio::time::Instant::from_std),
             )
         };
         if done {

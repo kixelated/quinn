@@ -25,7 +25,9 @@ async fn echo() {
         async {
             let (mut send, mut recv) = server.accept_bi().await.expect("accept_bi");
             let data = recv.read_to_end(1024).await.expect("read");
-            send.write_all(&data.to_ascii_uppercase()).await.expect("write");
+            send.write_all(&data.to_ascii_uppercase())
+                .await
+                .expect("write");
             send.finish().expect("finish");
         },
     );

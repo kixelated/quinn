@@ -331,7 +331,9 @@ fn application_close() {
 /// Wrap a frames payload in a record Size prefix
 fn record(frames: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    VarInt::from_u64(frames.len() as u64).unwrap().encode(&mut out);
+    VarInt::from_u64(frames.len() as u64)
+        .unwrap()
+        .encode(&mut out);
     out.extend_from_slice(frames);
     out
 }
@@ -395,7 +397,9 @@ fn unsolicited_ping_response() {
     let mut pair = Pair::default();
     pair.connect();
     let mut frames = Vec::new();
-    VarInt::from_u64(0x348c67529ef8c7be).unwrap().encode(&mut frames);
+    VarInt::from_u64(0x348c67529ef8c7be)
+        .unwrap()
+        .encode(&mut frames);
     VarInt::from_u32(5).encode(&mut frames);
     expect_transport_error(
         pair.server.handle_input(&record(&frames), pair.now),

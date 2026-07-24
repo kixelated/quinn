@@ -720,11 +720,7 @@ impl StreamsState {
     }
 
     #[allow(unreachable_pub)] // fuzzing/qmux only
-    pub fn received_max_streams(
-        &mut self,
-        dir: Dir,
-        count: u64,
-    ) -> Result<(), TransportError> {
+    pub fn received_max_streams(&mut self, dir: Dir, count: u64) -> Result<(), TransportError> {
         if count > MAX_STREAM_COUNT {
             return Err(TransportError::FRAME_ENCODING_ERROR(
                 "unrepresentable stream limit",

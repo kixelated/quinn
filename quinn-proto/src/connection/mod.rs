@@ -69,11 +69,11 @@ pub(crate) mod qlog;
 mod send_buffer;
 
 mod spaces;
+use spaces::{PacketNumberFilter, PacketSpace, SendableFrames, SentPacket};
 #[cfg(any(fuzzing, feature = "unstable-qmux"))]
 pub use spaces::{Retransmits, ThinRetransmits};
 #[cfg(not(any(fuzzing, feature = "unstable-qmux")))]
 use spaces::{Retransmits, ThinRetransmits};
-use spaces::{PacketNumberFilter, PacketSpace, SendableFrames, SentPacket};
 
 mod stats;
 pub use stats::{ConnectionStats, FrameStats, PathStats, UdpStats};

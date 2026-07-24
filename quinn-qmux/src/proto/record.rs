@@ -84,7 +84,7 @@ mod tests {
     #[test]
     fn oversized_record() {
         let mut deframer = Deframer::default();
-        deframer.push(&wrap(&vec![0; 100]));
+        deframer.push(&wrap(&[0; 100]));
         assert!(deframer.next(50).is_err());
     }
 }

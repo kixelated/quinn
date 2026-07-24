@@ -217,10 +217,7 @@ impl Connection {
         }
         self.deframer.push(data);
         loop {
-            match self
-                .deframer
-                .next(self.config.max_record_size.into_inner())
-            {
+            match self.deframer.next(self.config.max_record_size.into_inner()) {
                 Ok(Some(payload)) => self.handle_record(payload, now)?,
                 Ok(None) => return Ok(()),
                 Err(e) => return Err(self.fail(e)),
@@ -356,8 +353,13 @@ impl Connection {
         // part we need back is which RESET_STREAM frames were written, which are
         // considered acknowledged on transmission.
         let mut thin = ThinRetransmits::default();
-        self.streams
-            .write_control_frames(&mut buf, &mut self.pending, &mut thin, &mut self.stats, budget);
+        self.streams.write_control_frames(
+            &mut buf,
+            &mut self.pending,
+            &mut thin,
+            &mut self.stats,
+            budget,
+        );
         if let Some(retransmits) = thin.take() {
             let resets: Vec<_> = retransmits.reset_streams().collect();
             for id in resets {
@@ -439,7 +441,11 @@ impl Connection {
             return Err(SendDatagramError::UnsupportedByPeer);
         };
         let size = frame::datagram_frame_size(data.len()) as u64;
-        if size > max_frame.into_inner().min(peer.max_record_size.into_inner()) {
+        if size
+            > max_frame
+                .into_inner()
+                .min(peer.max_record_size.into_inner())
+        {
             return Err(SendDatagramError::TooLarge);
         }
         if self.datagram_send.len() >= self.config.datagram_send_queue {
@@ -459,7 +465,9 @@ impl Connection {
     pub fn max_datagram_size(&self) -> Option<usize> {
         let peer = self.peer_params.as_ref()?;
         let max_frame = peer.max_datagram_frame_size?;
-        let capacity = max_frame.into_inner().min(peer.max_record_size.into_inner());
+        let capacity = max_frame
+            .into_inner()
+            .min(peer.max_record_size.into_inner());
         // Subtract the frame type and a worst-case length prefix
         Some(usize::try_from(capacity.saturating_sub(1 + 4)).unwrap_or(usize::MAX))
     }
@@ -522,7 +530,8 @@ impl Connection {
                     peer.initial_max_streams_uni,
                 );
                 self.streams.set_params(&tp);
-                self.idle.set_peer_timeout(peer.max_idle_timeout.into_inner(), now);
+                self.idle
+                    .set_peer_timeout(peer.max_idle_timeout.into_inner(), now);
                 self.peer_params = Some(peer);
                 self.params_received = true;
                 self.events.push_back(Event::Connected);
@@ -588,7 +597,11 @@ impl Connection {
                 trace!(stream = %id, offset = offset.into_inner(), "peer reports STREAM_DATA_BLOCKED");
             }
             Frame::StreamsBlocked { dir, limit } => {
-                trace!(?dir, limit = limit.into_inner(), "peer reports STREAMS_BLOCKED");
+                trace!(
+                    ?dir,
+                    limit = limit.into_inner(),
+                    "peer reports STREAMS_BLOCKED"
+                );
             }
             Frame::Close(close) => {
                 let reason = match close.is_application {
@@ -626,7 +639,10 @@ impl Connection {
             }
             Frame::PingRequest(seq) => {
                 let seq = seq.into_inner();
-                if self.greatest_ping_recv.is_some_and(|greatest| seq <= greatest) {
+                if self
+                    .greatest_ping_recv
+                    .is_some_and(|greatest| seq <= greatest)
+                {
                     return Err(TransportError::new(
                         TransportErrorCode::PROTOCOL_VIOLATION,
                         "QX_PING sequence number did not increase".into(),

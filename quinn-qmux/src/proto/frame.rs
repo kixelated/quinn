@@ -10,7 +10,8 @@
 
 use bytes::{Buf, BufMut, Bytes};
 use quinn_proto::{
-    Dir, StreamId, TransportError, TransportErrorCode, VarInt, coding::Codec,
+    Dir, StreamId, TransportError, TransportErrorCode, VarInt,
+    coding::Codec,
     qmux_internal::{ResetStream, StreamFrame},
 };
 
