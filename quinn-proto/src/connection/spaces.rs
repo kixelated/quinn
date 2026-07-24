@@ -348,7 +348,22 @@ pub struct Retransmits {
 }
 
 impl Retransmits {
-    pub(super) fn is_empty(&self, streams: &StreamsState) -> bool {
+    /// Request transmission of a `MAX_DATA` frame
+    #[cfg(any(fuzzing, feature = "unstable-qmux"))]
+    #[allow(unreachable_pub)] // fuzzing/qmux only
+    pub fn queue_max_data(&mut self) {
+        self.max_data = true;
+    }
+
+    /// The streams for which a `RESET_STREAM` frame is queued
+    #[cfg(any(fuzzing, feature = "unstable-qmux"))]
+    #[allow(unreachable_pub)] // fuzzing/qmux only
+    pub fn reset_streams(&self) -> impl Iterator<Item = StreamId> + '_ {
+        self.reset_stream.iter().map(|&(id, _)| id)
+    }
+
+    #[allow(unreachable_pub)] // fuzzing/qmux only
+    pub fn is_empty(&self, streams: &StreamsState) -> bool {
         !self.max_data
             && !self.max_stream_id.into_iter().any(|x| x)
             && !self.streams_blocked.into_iter().any(|x| x)
@@ -412,12 +427,20 @@ impl ::std::iter::FromIterator<Self> for Retransmits {
 }
 
 /// A variant of `Retransmits` which only allocates storage when required
+#[allow(unnameable_types, unreachable_pub)] // fuzzing/qmux only
 #[derive(Debug, Default, Clone)]
-pub(super) struct ThinRetransmits {
+pub struct ThinRetransmits {
     retransmits: Option<Box<Retransmits>>,
 }
 
 impl ThinRetransmits {
+    /// Removes and returns the stored retransmits, if any
+    #[cfg(any(fuzzing, feature = "unstable-qmux"))]
+    #[allow(unreachable_pub)] // fuzzing/qmux only
+    pub fn take(&mut self) -> Option<Box<Retransmits>> {
+        self.retransmits.take()
+    }
+
     /// Returns `true` if no retransmits are necessary
     pub(super) fn is_empty(&self, streams: &StreamsState) -> bool {
         match &self.retransmits {

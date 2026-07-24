@@ -195,7 +195,8 @@ impl StreamsState {
         this
     }
 
-    pub(crate) fn set_params(&mut self, params: &TransportParameters) {
+    #[allow(unreachable_pub)] // fuzzing/qmux only
+    pub fn set_params(&mut self, params: &TransportParameters) {
         self.initial_max_stream_data_uni = params.initial_max_stream_data_uni;
         self.initial_max_stream_data_bidi_local = params.initial_max_stream_data_bidi_local;
         self.initial_max_stream_data_bidi_remote = params.initial_max_stream_data_bidi_remote;
@@ -253,7 +254,8 @@ impl StreamsState {
     /// Process incoming stream frame
     ///
     /// If successful, returns whether a `MAX_DATA` frame needs to be transmitted
-    pub(crate) fn received(
+    #[allow(unreachable_pub)] // fuzzing/qmux only
+    pub fn received(
         &mut self,
         frame: frame::Stream,
         payload_len: usize,
@@ -373,7 +375,8 @@ impl StreamsState {
         }
     }
 
-    pub(crate) fn reset_acked(&mut self, id: StreamId) {
+    #[allow(unreachable_pub)] // fuzzing/qmux only
+    pub fn reset_acked(&mut self, id: StreamId) {
         match self.send.entry(id) {
             hash_map::Entry::Vacant(_) => {}
             hash_map::Entry::Occupied(e) => {
@@ -386,7 +389,8 @@ impl StreamsState {
     }
 
     /// Whether any stream data is queued, regardless of control frames
-    pub(crate) fn can_send_stream_data(&self) -> bool {
+    #[allow(unreachable_pub)] // fuzzing/qmux only
+    pub fn can_send_stream_data(&self) -> bool {
         // Reset streams may linger in the pending stream list, but will never produce stream frames
         self.pending.iter().any(|stream| {
             self.send
@@ -405,7 +409,8 @@ impl StreamsState {
             .is_some_and(|s| s.can_send_flow_control())
     }
 
-    pub(in crate::connection) fn write_control_frames(
+    #[allow(unreachable_pub)] // fuzzing/qmux only
+    pub fn write_control_frames(
         &mut self,
         buf: &mut Vec<u8>,
         pending: &mut Retransmits,
@@ -556,7 +561,8 @@ impl StreamsState {
         }
     }
 
-    pub(crate) fn write_stream_frames(
+    #[allow(unreachable_pub)] // fuzzing/qmux only
+    pub fn write_stream_frames(
         &mut self,
         buf: &mut Vec<u8>,
         max_buf_size: usize,
@@ -650,7 +656,8 @@ impl StreamsState {
         }
     }
 
-    pub(crate) fn received_ack_of(&mut self, frame: frame::StreamMeta) {
+    #[allow(unreachable_pub)] // fuzzing/qmux only
+    pub fn received_ack_of(&mut self, frame: frame::StreamMeta) {
         let mut entry = match self.send.entry(frame.id) {
             hash_map::Entry::Vacant(_) => return,
             hash_map::Entry::Occupied(e) => e,
@@ -712,7 +719,8 @@ impl StreamsState {
         }
     }
 
-    pub(crate) fn received_max_streams(
+    #[allow(unreachable_pub)] // fuzzing/qmux only
+    pub fn received_max_streams(
         &mut self,
         dir: Dir,
         count: u64,
@@ -734,11 +742,13 @@ impl StreamsState {
     }
 
     /// Handle increase to connection-level flow control limit
-    pub(crate) fn received_max_data(&mut self, n: VarInt) {
+    #[allow(unreachable_pub)] // fuzzing/qmux only
+    pub fn received_max_data(&mut self, n: VarInt) {
         self.max_data = self.max_data.max(n.into());
     }
 
-    pub(crate) fn received_max_stream_data(
+    #[allow(unreachable_pub)] // fuzzing/qmux only
+    pub fn received_max_stream_data(
         &mut self,
         id: StreamId,
         offset: u64,
@@ -787,7 +797,8 @@ impl StreamsState {
     }
 
     /// Yield stream events
-    pub(crate) fn poll(&mut self) -> Option<StreamEvent> {
+    #[allow(unreachable_pub)] // fuzzing/qmux only
+    pub fn poll(&mut self) -> Option<StreamEvent> {
         if let Some(dir) = Dir::iter().find(|&i| mem::replace(&mut self.opened[i as usize], false))
         {
             return Some(StreamEvent::Opened { dir });
@@ -816,7 +827,8 @@ impl StreamsState {
     /// Queues MAX_STREAM_ID frames in `pending` if needed
     ///
     /// Returns whether any frames were queued.
-    pub(crate) fn queue_max_stream_id(&mut self, pending: &mut Retransmits) -> bool {
+    #[allow(unreachable_pub)] // fuzzing/qmux only
+    pub fn queue_max_stream_id(&mut self, pending: &mut Retransmits) -> bool {
         let mut queued = false;
         for dir in Dir::iter() {
             let diff = self.max_remote[dir as usize] - self.sent_max_remote[dir as usize];
@@ -860,7 +872,8 @@ impl StreamsState {
         id.index() >= self.next[id.dir() as usize]
     }
 
-    pub(crate) fn set_max_concurrent(&mut self, dir: Dir, count: VarInt) {
+    #[allow(unreachable_pub)] // fuzzing/qmux only
+    pub fn set_max_concurrent(&mut self, dir: Dir, count: VarInt) {
         self.flow_control_adjusted = true;
         self.max_concurrent_remote_count[dir as usize] = count.into();
         self.ensure_remote_streams(dir);

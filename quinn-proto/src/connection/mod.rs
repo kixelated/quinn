@@ -69,19 +69,19 @@ pub(crate) mod qlog;
 mod send_buffer;
 
 mod spaces;
-#[cfg(fuzzing)]
-pub use spaces::Retransmits;
-#[cfg(not(fuzzing))]
-use spaces::Retransmits;
-use spaces::{PacketNumberFilter, PacketSpace, SendableFrames, SentPacket, ThinRetransmits};
+#[cfg(any(fuzzing, feature = "unstable-qmux"))]
+pub use spaces::{Retransmits, ThinRetransmits};
+#[cfg(not(any(fuzzing, feature = "unstable-qmux")))]
+use spaces::{Retransmits, ThinRetransmits};
+use spaces::{PacketNumberFilter, PacketSpace, SendableFrames, SentPacket};
 
 mod stats;
 pub use stats::{ConnectionStats, FrameStats, PathStats, UdpStats};
 
 mod streams;
-#[cfg(fuzzing)]
+#[cfg(any(fuzzing, feature = "unstable-qmux"))]
 pub use streams::StreamsState;
-#[cfg(not(fuzzing))]
+#[cfg(not(any(fuzzing, feature = "unstable-qmux")))]
 use streams::StreamsState;
 pub use streams::{
     Chunks, ClosedStream, FinishError, ReadError, ReadableError, RecvStream, SendStream,
