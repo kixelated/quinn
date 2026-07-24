@@ -106,7 +106,9 @@ impl Shared {
                     }
                 }
                 Event::Stream(StreamEvent::Finished { .. }) => {}
-                Event::DatagramReceived => self.datagrams.notify_waiters(),
+                Event::DatagramReceived | Event::DatagramsUnblocked => {
+                    self.datagrams.notify_waiters()
+                }
                 Event::ConnectionLost { reason } => {
                     debug!(%reason, "connection lost");
                     self.connected.notify_waiters();
@@ -177,7 +179,7 @@ impl Session {
     where
         T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
-        let conn = proto::Connection::new(Arc::new(config), side, Instant::now());
+        let conn = proto::Connection::new(config, side, Instant::now());
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 conn,
@@ -323,7 +325,7 @@ impl Session {
     /// head-of-line blocking as stream data.
     pub fn send_datagram(&self, data: Bytes) -> Result<(), SendDatagramError> {
         let mut state = self.shared.lock();
-        let result = state.conn.send_datagram(data);
+        let result = state.conn.send_datagram(data, true);
         drop(state);
         self.shared.driver.notify_one();
         result

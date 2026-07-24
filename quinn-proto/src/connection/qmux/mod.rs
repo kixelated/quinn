@@ -13,15 +13,15 @@
 //! out records produced by [`Connection::poll_transmit`], run [`Connection::handle_timeout`]
 //! at [`Connection::poll_timeout`], and drain [`Connection::poll`] for application events.
 
-use std::{collections::VecDeque, sync::Arc};
+use std::collections::VecDeque;
 
 use bytes::Bytes;
-use rustc_hash::FxHashMap;
 use thiserror::Error;
 use tracing::trace;
 
 use super::{
     State as ConnectionState,
+    datagrams::DatagramState,
     spaces::{Retransmits, ThinRetransmits},
     stats::FrameStats,
     streams::StreamsState,
@@ -29,9 +29,11 @@ use super::{
 use crate::{
     ApplicationClose, ConnectionClose, Dir, Instant, Side, StreamId, TransportError,
     TransportErrorCode, VarInt,
-    frame::{Close, Datagram, Frame},
+    frame::{Close, Datagram, Frame, FrameStruct},
     transport_parameters::TransportParameters,
 };
+
+pub use super::datagrams::SendDatagramError;
 
 // The poll-level stream API is the rest of this crate's, re-exported for convenience
 pub use crate::{
@@ -61,6 +63,8 @@ pub enum Event {
     Stream(StreamEvent),
     /// One or more datagrams were received
     DatagramReceived,
+    /// Space was freed in the datagram send buffer after a send was blocked
+    DatagramsUnblocked,
     /// The connection was terminated
     ConnectionLost {
         /// Why the connection ended
@@ -91,24 +95,10 @@ pub enum ConnectionError {
     TransportClosed,
 }
 
-/// Errors from [`Connection::send_datagram`]
-#[derive(Debug, Clone, Error, PartialEq, Eq)]
-pub enum SendDatagramError {
-    /// The peer's transport parameters have not arrived yet
-    #[error("peer transport parameters not yet received")]
-    NotYetReady,
-    /// The peer does not accept datagrams
-    #[error("datagrams not supported by peer")]
-    UnsupportedByPeer,
-    /// The datagram exceeds the peer's advertised limits
-    #[error("datagram too large")]
-    TooLarge,
-}
-
 /// A QMux connection over a reliable, ordered transport
 pub struct Connection {
     side: Side,
-    config: Arc<Config>,
+    config: Config,
     streams: StreamsState,
     /// Control frames awaiting serialization; drained by `write_control_frames`
     pending: Retransmits,
@@ -119,8 +109,6 @@ pub struct Connection {
     params_received: bool,
     peer_params: Option<QmuxParams>,
 
-    /// Next expected receive offset per live stream, enforcing the draft's in-order rule
-    recv_offsets: FxHashMap<StreamId, u64>,
     deframer: Deframer,
     idle: IdleTimer,
 
@@ -129,8 +117,7 @@ pub struct Connection {
     ping_request_pending: bool,
     ping_responses: VecDeque<VarInt>,
 
-    datagram_send: VecDeque<Datagram>,
-    datagram_recv: VecDeque<Bytes>,
+    datagrams: DatagramState,
 
     /// CONNECTION_CLOSE / APPLICATION_CLOSE frame awaiting transmission
     close: Option<Close>,
@@ -141,16 +128,21 @@ pub struct Connection {
 
 impl Connection {
     /// Create a connection; `side` distinguishes client- from server-initiated stream IDs
-    pub fn new(config: Arc<Config>, side: Side, now: Instant) -> Self {
+    pub fn new(config: Config, side: Side, now: Instant) -> Self {
+        let transport = &config.transport;
         let streams = StreamsState::new(
             side,
-            config.max_concurrent_uni_streams,
-            config.max_concurrent_bidi_streams,
-            config.send_window,
-            config.receive_window,
-            config.stream_receive_window,
+            transport.max_concurrent_uni_streams,
+            transport.max_concurrent_bidi_streams,
+            transport.send_window,
+            transport.receive_window,
+            transport.stream_receive_window,
         );
-        let idle = IdleTimer::new(config.max_idle_timeout, now);
+        let idle = IdleTimer::new(
+            transport.max_idle_timeout,
+            transport.keep_alive_interval,
+            now,
+        );
         Self {
             side,
             config,
@@ -161,15 +153,13 @@ impl Connection {
             params_sent: false,
             params_received: false,
             peer_params: None,
-            recv_offsets: FxHashMap::default(),
             deframer: Deframer::default(),
             idle,
             next_ping_seq: 0,
             greatest_ping_recv: None,
             ping_request_pending: false,
             ping_responses: VecDeque::new(),
-            datagram_send: VecDeque::new(),
-            datagram_recv: VecDeque::new(),
+            datagrams: DatagramState::default(),
             close: None,
             close_sent: false,
             error: None,
@@ -325,12 +315,18 @@ impl Connection {
             }
         }
 
-        while let Some(datagram) = self.datagram_send.front() {
+        let mut datagrams_sent = false;
+        while let Some(datagram) = self.datagrams.outgoing.front() {
             if buf.len() + datagram.size(true) > budget {
                 break;
             }
+            let datagram = self.datagrams.outgoing.pop_front().unwrap();
+            self.datagrams.outgoing_total -= datagram.data.len();
             datagram.encode(true, &mut buf);
-            self.datagram_send.pop_front();
+            datagrams_sent = true;
+        }
+        if datagrams_sent && std::mem::take(&mut self.datagrams.send_blocked) {
+            self.events.push_back(Event::DatagramsUnblocked);
         }
 
         // Flow control and stream lifecycle frames. Everything drained from `pending` is
@@ -428,63 +424,73 @@ impl Connection {
     /// Queue a datagram for transmission
     ///
     /// Unlike QUIC, a QMux datagram is delivered reliably and in order once sent, and is
-    /// subject to the same head-of-line blocking as other data. If the send queue is full
-    /// the oldest queued datagram is dropped.
-    pub fn send_datagram(&mut self, data: Bytes) -> Result<(), SendDatagramError> {
-        let Some(peer) = &self.peer_params else {
-            return Err(SendDatagramError::NotYetReady);
-        };
-        let Some(max_frame) = peer.tp.max_datagram_frame_size else {
-            return Err(SendDatagramError::UnsupportedByPeer);
-        };
-        let datagram = Datagram { data };
-        if datagram.size(true) as u64
-            > max_frame
-                .into_inner()
-                .min(peer.max_record_size.into_inner())
-        {
+    /// subject to the same head-of-line blocking as other data. As in quinn, if `drop` is
+    /// true, older queued datagrams are discarded to make space; otherwise a full send
+    /// buffer returns [`SendDatagramError::Blocked`] and [`Event::DatagramsUnblocked`]
+    /// fires once space frees up.
+    pub fn send_datagram(&mut self, data: Bytes, drop: bool) -> Result<(), SendDatagramError> {
+        if self.config.transport.datagram_receive_buffer_size.is_none() {
+            return Err(SendDatagramError::Disabled);
+        }
+        let max = self
+            .max_datagram_size()
+            .ok_or(SendDatagramError::UnsupportedByPeer)?;
+        let send_buffer_size = self.config.transport.datagram_send_buffer_size;
+        if data.len() > max.min(send_buffer_size) {
             return Err(SendDatagramError::TooLarge);
         }
-        if self.datagram_send.len() >= self.config.datagram_send_queue {
-            self.datagram_send.pop_front();
+        if drop {
+            self.datagrams.make_space_for(data.len(), send_buffer_size);
+        } else if !self
+            .datagrams
+            .has_send_buffer_space(data.len(), send_buffer_size)
+        {
+            self.datagrams.send_blocked = true;
+            return Err(SendDatagramError::Blocked(data));
         }
-        self.datagram_send.push_back(datagram);
+        self.datagrams.outgoing_total += data.len();
+        self.datagrams.outgoing.push_back(Datagram { data });
         Ok(())
     }
 
     /// Receive a queued datagram
     pub fn recv_datagram(&mut self) -> Option<Bytes> {
-        self.datagram_recv.pop_front()
+        self.datagrams.recv()
     }
 
     /// Largest datagram payload the peer accepts, or `None` before the handshake or when
     /// the peer disabled datagrams
+    ///
+    /// The record-based analogue of quinn's MTU-derived limit: bounded by the peer's
+    /// `max_datagram_frame_size` and `max_record_size`.
     pub fn max_datagram_size(&self) -> Option<usize> {
         let peer = self.peer_params.as_ref()?;
-        let max_frame = peer.tp.max_datagram_frame_size?;
-        let capacity = max_frame
+        let capacity = peer
+            .tp
+            .max_datagram_frame_size?
             .into_inner()
             .min(peer.max_record_size.into_inner());
-        // Subtract the frame type and a worst-case length prefix
-        Some(usize::try_from(capacity.saturating_sub(1 + 4)).unwrap_or(usize::MAX))
+        Some(
+            usize::try_from(capacity.saturating_sub(Datagram::SIZE_BOUND as u64))
+                .unwrap_or(usize::MAX),
+        )
     }
 
     fn local_params(&self) -> QmuxParams {
-        let idle_ms = self
-            .config
-            .max_idle_timeout
-            .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX))
-            .unwrap_or(0);
+        let transport = &self.config.transport;
         QmuxParams {
             tp: TransportParameters {
-                max_idle_timeout: VarInt::from_u64(idle_ms).unwrap_or(VarInt::MAX),
-                initial_max_data: self.config.receive_window,
-                initial_max_stream_data_bidi_local: self.config.stream_receive_window,
-                initial_max_stream_data_bidi_remote: self.config.stream_receive_window,
-                initial_max_stream_data_uni: self.config.stream_receive_window,
-                initial_max_streams_bidi: self.config.max_concurrent_bidi_streams,
-                initial_max_streams_uni: self.config.max_concurrent_uni_streams,
-                max_datagram_frame_size: self.config.max_datagram_frame_size,
+                max_idle_timeout: transport.max_idle_timeout.unwrap_or(VarInt::from_u32(0)),
+                initial_max_data: transport.receive_window,
+                initial_max_stream_data_bidi_local: transport.stream_receive_window,
+                initial_max_stream_data_bidi_remote: transport.stream_receive_window,
+                initial_max_stream_data_uni: transport.stream_receive_window,
+                initial_max_streams_bidi: transport.max_concurrent_bidi_streams,
+                initial_max_streams_uni: transport.max_concurrent_uni_streams,
+                // Derived from the receive buffer, exactly as quinn advertises it
+                max_datagram_frame_size: transport
+                    .datagram_receive_buffer_size
+                    .map(|size| (size.min(u16::MAX.into()) as u16).into()),
                 ..TransportParameters::default()
             },
             max_record_size: self.config.max_record_size,
@@ -522,8 +528,7 @@ impl Connection {
             QmuxFrame::TransportParameters(blob) => {
                 let peer = QmuxParams::decode(self.side, blob)?;
                 self.streams.set_params(&peer.tp);
-                self.idle
-                    .set_peer_timeout(peer.tp.max_idle_timeout.into_inner(), now);
+                self.idle.set_peer_timeout(peer.tp.max_idle_timeout, now);
                 self.peer_params = Some(peer);
                 self.params_received = true;
                 self.events.push_back(Event::Connected);
@@ -562,7 +567,6 @@ impl Connection {
             QmuxFrame::ResetStreamAt(reset) => {
                 // On a reliable transport all stream data was already delivered to us, so
                 // the partial-delivery guarantee is trivially satisfied; treat as a reset
-                self.recv_offsets.remove(&reset.id);
                 let transmit = self.streams.received_reset(reset)?;
                 if transmit.should_transmit() {
                     self.pending.max_data = true;
@@ -576,20 +580,17 @@ impl Connection {
             Frame::Padding => {}
             Frame::Stream(stream) => {
                 // The draft requires stream payloads to arrive in offset order; a gap can
-                // only mean a peer bug, since the transport is ordered. Data on a stream
-                // that already ended (entry removed on FIN or reset) is likewise a
-                // violation of its final size.
-                let id = stream.id;
-                let expected = self.recv_offsets.entry(id).or_insert(0);
-                if stream.offset != *expected {
-                    return Err(TransportError::new(
-                        TransportErrorCode::PROTOCOL_VIOLATION,
-                        "stream payload received out of order".into(),
-                    ));
-                }
-                *expected += stream.data.len() as u64;
-                if stream.fin {
-                    self.recv_offsets.remove(&id);
+                // only mean a peer bug, since the transport is ordered. The expected
+                // offset is the stream state's own receive progress; frames for streams
+                // without a live receive half fall through to `received`, which validates
+                // or discards them as quinn normally would.
+                if let Some(expected) = self.streams.rx_offset(stream.id) {
+                    if stream.offset != expected {
+                        return Err(TransportError::new(
+                            TransportErrorCode::PROTOCOL_VIOLATION,
+                            "stream payload received out of order".into(),
+                        ));
+                    }
                 }
                 let transmit = self.streams.received(stream, payload_len)?;
                 if transmit.should_transmit() {
@@ -597,7 +598,6 @@ impl Connection {
                 }
             }
             Frame::ResetStream(reset) => {
-                self.recv_offsets.remove(&reset.id);
                 let transmit = self.streams.received_reset(reset)?;
                 if transmit.should_transmit() {
                     self.pending.max_data = true;
@@ -629,24 +629,14 @@ impl Connection {
                 self.lost(ConnectionError::ConnectionClosed(close));
             }
             Frame::Datagram(datagram) => {
-                let Some(max_frame) = self.config.max_datagram_frame_size else {
-                    return Err(TransportError::new(
-                        TransportErrorCode::PROTOCOL_VIOLATION,
-                        "DATAGRAM frame received but datagrams are disabled".into(),
-                    ));
-                };
-                if datagram.size(true) as u64 > max_frame.into_inner() {
-                    return Err(TransportError::new(
-                        TransportErrorCode::PROTOCOL_VIOLATION,
-                        "oversized DATAGRAM frame".into(),
-                    ));
+                // Validation, buffering, and dropping stale datagrams when the
+                // application lags are all quinn's usual behavior
+                if self.datagrams.received(
+                    datagram,
+                    &self.config.transport.datagram_receive_buffer_size,
+                )? {
+                    self.events.push_back(Event::DatagramReceived);
                 }
-                // Received datagrams may be dropped when the application lags
-                if self.datagram_recv.len() >= self.config.datagram_recv_queue {
-                    self.datagram_recv.pop_front();
-                }
-                self.datagram_recv.push_back(datagram.data);
-                self.events.push_back(Event::DatagramReceived);
             }
             // The QUIC frames QMux prohibits: ACK, PING, CRYPTO, NEW_TOKEN, connection ID
             // and path management, ACK_FREQUENCY, IMMEDIATE_ACK, HANDSHAKE_DONE

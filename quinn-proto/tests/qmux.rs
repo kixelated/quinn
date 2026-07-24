@@ -11,10 +11,20 @@ use std::{
 
 use bytes::Bytes;
 use quinn_proto::{
-    Dir, Side, StreamEvent, StreamId, TransportErrorCode, VarInt,
+    Dir, Side, StreamEvent, StreamId, TransportConfig, TransportErrorCode, VarInt,
     coding::Codec,
     qmux::{Config, Connection, ConnectionError, Event, SendDatagramError, WriteError},
 };
+
+/// Build a [`Config`] with customized transport settings
+fn config(f: impl FnOnce(&mut TransportConfig)) -> Config {
+    let mut transport = TransportConfig::default();
+    f(&mut transport);
+    Config {
+        transport: Arc::new(transport),
+        ..Config::default()
+    }
+}
 
 struct Pair {
     client: Connection,
@@ -26,8 +36,8 @@ impl Pair {
     fn new(client_config: Config, server_config: Config) -> Self {
         let now = Instant::now();
         Self {
-            client: Connection::new(Arc::new(client_config), Side::Client, now),
-            server: Connection::new(Arc::new(server_config), Side::Server, now),
+            client: Connection::new(client_config, Side::Client, now),
+            server: Connection::new(server_config, Side::Server, now),
             now,
         }
     }
@@ -140,11 +150,12 @@ fn bidi_transfer() {
 #[test]
 fn large_transfer_with_flow_control() {
     // Windows far smaller than the payload force MAX_DATA / MAX_STREAM_DATA exchanges
-    let mut config = Config::default();
-    config
-        .receive_window(VarInt::from_u32(16 * 1024))
-        .stream_receive_window(VarInt::from_u32(8 * 1024))
-        .send_window(4 * 1024);
+    let config = config(|transport| {
+        transport
+            .receive_window(VarInt::from_u32(16 * 1024))
+            .stream_receive_window(VarInt::from_u32(8 * 1024))
+            .send_window(4 * 1024);
+    });
     let mut pair = Pair::new(config.clone(), config);
     pair.connect();
 
@@ -182,8 +193,9 @@ fn large_transfer_with_flow_control() {
 
 #[test]
 fn send_window_blocked_writer_wakes() {
-    let mut config = Config::default();
-    config.send_window(8);
+    let config = config(|transport| {
+        transport.send_window(8);
+    });
     let mut pair = Pair::new(config, Config::default());
     pair.connect();
     let _ = events(&mut pair.client);
@@ -208,8 +220,9 @@ fn send_window_blocked_writer_wakes() {
 
 #[test]
 fn stream_limits_recycle() {
-    let mut config = Config::default();
-    config.max_concurrent_uni_streams(VarInt::from_u32(2));
+    let config = config(|transport| {
+        transport.max_concurrent_uni_streams(VarInt::from_u32(2));
+    });
     let mut pair = Pair::new(Config::default(), config);
     pair.connect();
 
@@ -269,13 +282,14 @@ fn reset_and_stop() {
 fn datagrams() {
     let mut pair = Pair::default();
     assert_eq!(
-        pair.client.send_datagram(Bytes::from_static(b"early")),
-        Err(SendDatagramError::NotYetReady)
+        pair.client
+            .send_datagram(Bytes::from_static(b"early"), true),
+        Err(SendDatagramError::UnsupportedByPeer)
     );
     pair.connect();
 
     pair.client
-        .send_datagram(Bytes::from_static(b"hello datagram"))
+        .send_datagram(Bytes::from_static(b"hello datagram"), true)
         .unwrap();
     pair.drive();
     assert!(
@@ -291,19 +305,20 @@ fn datagrams() {
 
     let too_large = vec![0; 64 * 1024];
     assert_eq!(
-        pair.client.send_datagram(too_large.into()),
+        pair.client.send_datagram(too_large.into(), true),
         Err(SendDatagramError::TooLarge)
     );
 }
 
 #[test]
 fn datagrams_disabled() {
-    let mut receiver = Config::default();
-    receiver.max_datagram_frame_size(None);
+    let receiver = config(|transport| {
+        transport.datagram_receive_buffer_size(None);
+    });
     let mut pair = Pair::new(Config::default(), receiver);
     pair.connect();
     assert_eq!(
-        pair.client.send_datagram(Bytes::from_static(b"nope")),
+        pair.client.send_datagram(Bytes::from_static(b"nope"), true),
         Err(SendDatagramError::UnsupportedByPeer)
     );
 }
@@ -412,12 +427,14 @@ fn unsolicited_ping_response() {
 
 #[test]
 fn keepalive_and_idle_timeout() {
-    let mut config = Config::default();
-    config.max_idle_timeout(Some(Duration::from_secs(3)));
+    let config = config(|transport| {
+        transport.max_idle_timeout(Some(Duration::from_secs(3).try_into().unwrap()));
+        transport.keep_alive_interval(Some(Duration::from_secs(1)));
+    });
     let mut pair = Pair::new(config, Config::default());
     pair.connect();
 
-    // A keep-alive ping request goes out at a third of the idle timeout
+    // A keep-alive ping request goes out at the configured interval
     let at = pair.client.poll_timeout().expect("timeout scheduled");
     assert!(at <= pair.now + Duration::from_secs(1));
     pair.now = at;
@@ -472,6 +489,6 @@ fn data_after_fin_rejected() {
     frames.push(b'x');
     expect_transport_error(
         pair.server.handle_input(&record(&frames), pair.now),
-        TransportErrorCode::PROTOCOL_VIOLATION,
+        TransportErrorCode::FINAL_SIZE_ERROR,
     );
 }

@@ -1,6 +1,9 @@
 //! End-to-end tests over an in-memory duplex transport
 
+use std::sync::Arc;
+
 use bytes::Bytes;
+use quinn_proto::TransportConfig;
 use quinn_qmux::{Config, ConnectionError, ReadError, Session, VarInt, WriteError};
 
 async fn pair(client: Config, server: Config) -> (Session, Session) {
@@ -38,11 +41,15 @@ async fn echo() {
 async fn large_uni_transfer_with_backpressure() {
     // Windows much smaller than the payload, so MAX_DATA/MAX_STREAM_DATA must flow the
     // other way while data is in flight
-    let mut config = Config::default();
-    config
+    let mut transport = TransportConfig::default();
+    transport
         .receive_window(VarInt::from_u32(64 * 1024))
         .stream_receive_window(VarInt::from_u32(32 * 1024))
         .send_window(16 * 1024);
+    let config = Config {
+        transport: Arc::new(transport),
+        ..Config::default()
+    };
     let (client, server) = pair(config.clone(), config).await;
 
     let payload: Vec<u8> = (0..1_000_000).map(|i| (i % 241) as u8).collect();

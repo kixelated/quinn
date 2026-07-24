@@ -136,7 +136,7 @@ impl DatagramState {
         Ok(was_empty)
     }
 
-    fn make_space_for(&mut self, datagram_len: usize, send_buffer_size: usize) {
+    pub(super) fn make_space_for(&mut self, datagram_len: usize, send_buffer_size: usize) {
         while !self.has_send_buffer_space(datagram_len, send_buffer_size) {
             let Some(prev) = self.outgoing.pop_front() else {
                 break;
@@ -146,7 +146,11 @@ impl DatagramState {
         }
     }
 
-    fn has_send_buffer_space(&self, datagram_len: usize, send_buffer_size: usize) -> bool {
+    pub(super) fn has_send_buffer_space(
+        &self,
+        datagram_len: usize,
+        send_buffer_size: usize,
+    ) -> bool {
         let Some(total) = self.outgoing_total.checked_add(datagram_len) else {
             return false;
         };
