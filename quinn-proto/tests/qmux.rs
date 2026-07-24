@@ -1,4 +1,8 @@
 //! Deterministic tests driving two sans-IO connections against each other
+//!
+//! Not built for wasm targets, where the state machine uses `web_time::Instant` instead
+//! of `std::time::Instant`.
+#![cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 
 use std::{
     sync::Arc,
