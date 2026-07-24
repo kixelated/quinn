@@ -7,41 +7,42 @@
 //! acknowledged the moment they are serialized into a record, and nothing is ever
 //! retransmitted at this layer.
 //!
-//! Like `quinn_proto::Connection`, this type performs no I/O. Feed received transport
+//! Like [`crate::Connection`], this type performs no I/O. Feed received transport
 //! bytes to [`Connection::handle_input`] (or whole records to
 //! [`Connection::handle_record`] on message-oriented transports such as WebSocket), write
 //! out records produced by [`Connection::poll_transmit`], run [`Connection::handle_timeout`]
 //! at [`Connection::poll_timeout`], and drain [`Connection::poll`] for application events.
 
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::Arc,
-    time::Instant,
-};
+use std::{collections::VecDeque, sync::Arc};
 
 use bytes::Bytes;
+use rustc_hash::FxHashMap;
 use thiserror::Error;
 use tracing::trace;
 
-use quinn_proto::{
-    Dir, Side, StreamEvent, StreamId, TransportError, TransportErrorCode, VarInt,
-    qmux_internal::{
-        ConnectionState, FrameStats, Retransmits, StreamsState, ThinRetransmits,
-        stream_transport_parameters,
-    },
+use super::{
+    State as ConnectionState,
+    spaces::{Retransmits, ThinRetransmits},
+    stats::FrameStats,
+    streams::StreamsState,
+};
+use crate::{
+    Dir, Instant, Side, StreamId, TransportError, TransportErrorCode, VarInt,
+    transport_parameters::TransportParameters,
 };
 
-// The poll-level stream API is quinn-proto's, re-exported for sans-IO users
-pub use quinn_proto::{
-    Chunks, ClosedStream, FinishError, ReadError, ReadableError, RecvStream, SendStream, Streams,
-    WriteError, Written,
+// The poll-level stream API is the rest of this crate's, re-exported for convenience
+pub use crate::{
+    Chunks, ClosedStream, FinishError, ReadError, ReadableError, RecvStream, SendStream,
+    StreamEvent, Streams, WriteError, Written,
 };
 
-use crate::config::Config;
+mod config;
+pub use config::Config;
 
-pub(crate) mod frame;
-pub(crate) mod params;
-pub(crate) mod record;
+mod frame;
+mod params;
+mod record;
 mod timer;
 
 use frame::{Close, Frame};
@@ -129,7 +130,7 @@ pub struct Connection {
     peer_params: Option<QmuxParams>,
 
     /// Next expected receive offset per live stream, enforcing the draft's in-order rule
-    recv_offsets: HashMap<StreamId, u64>,
+    recv_offsets: FxHashMap<StreamId, u64>,
     deframer: Deframer,
     idle: IdleTimer,
 
@@ -170,7 +171,7 @@ impl Connection {
             params_sent: false,
             params_received: false,
             peer_params: None,
-            recv_offsets: HashMap::new(),
+            recv_offsets: FxHashMap::default(),
             deframer: Deframer::default(),
             idle,
             next_ping_seq: 0,
@@ -360,8 +361,8 @@ impl Connection {
             &mut self.stats,
             budget,
         );
-        if let Some(retransmits) = thin.take() {
-            let resets: Vec<_> = retransmits.reset_streams().collect();
+        if let Some(retransmits) = thin.get() {
+            let resets: Vec<_> = retransmits.reset_stream.iter().map(|&(id, _)| id).collect();
             for id in resets {
                 self.streams.reset_acked(id);
             }
@@ -415,17 +416,29 @@ impl Connection {
 
     /// Open and accept streams
     pub fn streams(&mut self) -> Streams<'_> {
-        Streams::new(&mut self.streams, &self.conn_state)
+        Streams {
+            state: &mut self.streams,
+            conn_state: &self.conn_state,
+        }
     }
 
     /// Operate on a stream's send half
     pub fn send_stream(&mut self, id: StreamId) -> SendStream<'_> {
-        SendStream::new(id, &mut self.streams, &mut self.pending, &self.conn_state)
+        SendStream {
+            id,
+            state: &mut self.streams,
+            pending: &mut self.pending,
+            conn_state: &self.conn_state,
+        }
     }
 
     /// Operate on a stream's receive half
     pub fn recv_stream(&mut self, id: StreamId) -> RecvStream<'_> {
-        RecvStream::new(id, &mut self.streams, &mut self.pending)
+        RecvStream {
+            id,
+            state: &mut self.streams,
+            pending: &mut self.pending,
+        }
     }
 
     /// Queue a datagram for transmission
@@ -521,14 +534,15 @@ impl Connection {
         match frame {
             Frame::TransportParameters(blob) => {
                 let peer = QmuxParams::decode(blob)?;
-                let tp = stream_transport_parameters(
-                    peer.initial_max_data,
-                    peer.initial_max_stream_data_bidi_local,
-                    peer.initial_max_stream_data_bidi_remote,
-                    peer.initial_max_stream_data_uni,
-                    peer.initial_max_streams_bidi,
-                    peer.initial_max_streams_uni,
-                );
+                let tp = TransportParameters {
+                    initial_max_data: peer.initial_max_data,
+                    initial_max_stream_data_bidi_local: peer.initial_max_stream_data_bidi_local,
+                    initial_max_stream_data_bidi_remote: peer.initial_max_stream_data_bidi_remote,
+                    initial_max_stream_data_uni: peer.initial_max_stream_data_uni,
+                    initial_max_streams_bidi: peer.initial_max_streams_bidi,
+                    initial_max_streams_uni: peer.initial_max_streams_uni,
+                    ..TransportParameters::default()
+                };
                 self.streams.set_params(&tp);
                 self.idle
                     .set_peer_timeout(peer.max_idle_timeout.into_inner(), now);
@@ -560,14 +574,14 @@ impl Connection {
                 }
                 let transmit = self.streams.received(stream, payload_len)?;
                 if transmit.should_transmit() {
-                    self.pending.queue_max_data();
+                    self.pending.max_data = true;
                 }
             }
             Frame::ResetStream(reset) => {
                 self.recv_offsets.remove(&reset.id);
                 let transmit = self.streams.received_reset(reset)?;
                 if transmit.should_transmit() {
-                    self.pending.queue_max_data();
+                    self.pending.max_data = true;
                 }
             }
             Frame::ResetStreamAt(reset) => {
@@ -576,7 +590,7 @@ impl Connection {
                 self.recv_offsets.remove(&reset.id);
                 let transmit = self.streams.received_reset(reset)?;
                 if transmit.should_transmit() {
-                    self.pending.queue_max_data();
+                    self.pending.max_data = true;
                 }
             }
             Frame::StopSending { id, error_code } => {

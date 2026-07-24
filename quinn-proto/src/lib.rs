@@ -12,7 +12,7 @@
 //! related `Connection`. `Connection` types contain the bulk of the protocol logic related to
 //! managing a single connection and all the related state (such as streams).
 
-#![cfg_attr(not(any(fuzzing, feature = "unstable-qmux")), warn(missing_docs))]
+#![cfg_attr(not(fuzzing), warn(missing_docs))]
 #![cfg_attr(test, allow(dead_code))]
 // Fixes welcome:
 #![warn(unreachable_pub)]
@@ -43,6 +43,7 @@ mod bloom_token_log;
 pub use bloom_token_log::BloomTokenLog;
 
 mod connection;
+pub use crate::connection::qmux;
 pub use crate::connection::{
     Chunk, Chunks, ClosedStream, Connection, ConnectionError, ConnectionStats, Datagrams, Event,
     FinishError, FrameStats, PathStats, ReadError, ReadableError, RecvStream, RttEstimator,
@@ -111,10 +112,8 @@ pub(crate) use web_time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(fuzzing)]
 pub mod fuzzing {
-    pub use crate::connection::{
-        Retransmits, State as ConnectionState, StreamsState, ThinRetransmits,
-    };
-    pub use crate::frame::{ResetStream, Stream as StreamFrame, StreamMeta, StreamMetaVec};
+    pub use crate::connection::{Retransmits, State as ConnectionState, StreamsState};
+    pub use crate::frame::ResetStream;
     pub use crate::packet::PartialDecode;
     pub use crate::transport_parameters::TransportParameters;
     pub use bytes::{BufMut, BytesMut};
@@ -154,45 +153,6 @@ pub mod fuzzing {
                 buf,
                 grease_quic_bit: bool::arbitrary(u)?,
             })
-        }
-    }
-}
-
-/// Unstable internals used by the in-workspace `quinn-qmux` crate
-///
-/// Exposes the stream state machine so it can be driven over a reliable, ordered transport
-/// (draft-ietf-quic-qmux). Not covered by semver — do not use outside this workspace.
-#[cfg(feature = "unstable-qmux")]
-#[doc(hidden)]
-pub mod qmux_internal {
-    pub use crate::connection::{
-        FrameStats, Retransmits, State as ConnectionState, StreamsState, ThinRetransmits,
-    };
-    pub use crate::frame::{ResetStream, Stream as StreamFrame, StreamMeta, StreamMetaVec};
-    pub use crate::transport_parameters::TransportParameters;
-
-    use crate::VarInt;
-
-    /// Build a [`TransportParameters`] carrying only the flow-control limits QMux uses
-    ///
-    /// The result is intended solely for [`StreamsState::set_params`]; all other fields
-    /// hold their defaults.
-    pub fn stream_transport_parameters(
-        initial_max_data: VarInt,
-        initial_max_stream_data_bidi_local: VarInt,
-        initial_max_stream_data_bidi_remote: VarInt,
-        initial_max_stream_data_uni: VarInt,
-        initial_max_streams_bidi: VarInt,
-        initial_max_streams_uni: VarInt,
-    ) -> TransportParameters {
-        TransportParameters {
-            initial_max_data,
-            initial_max_stream_data_bidi_local,
-            initial_max_stream_data_bidi_remote,
-            initial_max_stream_data_uni,
-            initial_max_streams_bidi,
-            initial_max_streams_uni,
-            ..TransportParameters::default()
         }
     }
 }

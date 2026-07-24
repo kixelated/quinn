@@ -35,7 +35,7 @@ pub struct Streams<'a> {
 
 #[allow(clippy::needless_lifetimes)] // Needed for cfg(fuzzing)
 impl<'a> Streams<'a> {
-    #[cfg(any(fuzzing, feature = "unstable-qmux"))]
+    #[cfg(fuzzing)]
     pub fn new(state: &'a mut StreamsState, conn_state: &'a super::State) -> Self {
         Self { state, conn_state }
     }
@@ -78,7 +78,7 @@ impl<'a> Streams<'a> {
         Some(StreamId::new(!self.state.side, dir, x))
     }
 
-    #[cfg(any(fuzzing, feature = "unstable-qmux"))]
+    #[cfg(fuzzing)]
     pub fn state(&mut self) -> &mut StreamsState {
         self.state
     }
@@ -106,14 +106,6 @@ pub struct RecvStream<'a> {
     pub(super) id: StreamId,
     pub(super) state: &'a mut StreamsState,
     pub(super) pending: &'a mut Retransmits,
-}
-
-#[allow(clippy::needless_lifetimes)] // Needed for cfg(any(fuzzing, feature = "unstable-qmux"))
-impl<'a> RecvStream<'a> {
-    #[cfg(any(fuzzing, feature = "unstable-qmux"))]
-    pub fn new(id: StreamId, state: &'a mut StreamsState, pending: &'a mut Retransmits) -> Self {
-        Self { id, state, pending }
-    }
 }
 
 impl RecvStream<'_> {
@@ -210,7 +202,7 @@ pub struct SendStream<'a> {
 
 #[allow(clippy::needless_lifetimes)] // Needed for cfg(fuzzing)
 impl<'a> SendStream<'a> {
-    #[cfg(any(fuzzing, feature = "unstable-qmux"))]
+    #[cfg(fuzzing)]
     pub fn new(
         id: StreamId,
         state: &'a mut StreamsState,

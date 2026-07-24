@@ -41,10 +41,6 @@ qlog = ["dep:qlog"]
 
 __rustls-post-quantum-test =  []
 
-# Internal (PRIVATE!) feature exposing the stream state machine for reuse by the
-# in-workspace `quinn-qmux` crate. Not covered by semver; may change at any time.
-unstable-qmux = []
-
 [dependencies]
 arbitrary = { workspace = true, optional = true }
 aws-lc-rs = { workspace = true, optional = true }

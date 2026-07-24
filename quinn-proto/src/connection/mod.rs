@@ -64,24 +64,26 @@ mod paths;
 pub use paths::RttEstimator;
 use paths::{PathData, PathResponses};
 
+pub mod qmux;
+
 pub(crate) mod qlog;
 
 mod send_buffer;
 
 mod spaces;
-use spaces::{PacketNumberFilter, PacketSpace, SendableFrames, SentPacket};
-#[cfg(any(fuzzing, feature = "unstable-qmux"))]
-pub use spaces::{Retransmits, ThinRetransmits};
-#[cfg(not(any(fuzzing, feature = "unstable-qmux")))]
-use spaces::{Retransmits, ThinRetransmits};
+#[cfg(fuzzing)]
+pub use spaces::Retransmits;
+#[cfg(not(fuzzing))]
+use spaces::Retransmits;
+use spaces::{PacketNumberFilter, PacketSpace, SendableFrames, SentPacket, ThinRetransmits};
 
 mod stats;
 pub use stats::{ConnectionStats, FrameStats, PathStats, UdpStats};
 
 mod streams;
-#[cfg(any(fuzzing, feature = "unstable-qmux"))]
+#[cfg(fuzzing)]
 pub use streams::StreamsState;
-#[cfg(not(any(fuzzing, feature = "unstable-qmux")))]
+#[cfg(not(fuzzing))]
 use streams::StreamsState;
 pub use streams::{
     Chunks, ClosedStream, FinishError, ReadError, ReadableError, RecvStream, SendStream,

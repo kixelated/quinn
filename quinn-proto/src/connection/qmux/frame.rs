@@ -8,12 +8,12 @@
 //! STREAM, RESET_STREAM, STOP_SENDING, MAX_DATA, MAX_STREAM_DATA, MAX_STREAMS and
 //! STREAMS_BLOCKED are written directly by `StreamsState`.
 
-use bytes::{Buf, BufMut, Bytes};
-use quinn_proto::{
+use crate::{
     Dir, StreamId, TransportError, TransportErrorCode, VarInt,
     coding::Codec,
-    qmux_internal::{ResetStream, StreamFrame},
+    frame::{ResetStream, Stream as StreamFrame},
 };
+use bytes::{Buf, BufMut, Bytes};
 
 pub(crate) const PADDING: u64 = 0x00;
 pub(crate) const RESET_STREAM: u64 = 0x04;

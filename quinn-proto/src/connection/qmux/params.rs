@@ -7,8 +7,8 @@
 
 use std::collections::HashSet;
 
+use crate::{TransportError, TransportErrorCode, VarInt, coding::Codec};
 use bytes::{Buf, BufMut, Bytes};
-use quinn_proto::{TransportError, TransportErrorCode, VarInt, coding::Codec};
 
 const MAX_IDLE_TIMEOUT: u64 = 0x01;
 const INITIAL_MAX_DATA: u64 = 0x04;
@@ -74,7 +74,7 @@ fn err(reason: &str) -> TransportError {
 
 fn write_param<B: BufMut>(buf: &mut B, id: u64, value: VarInt) {
     VarInt::from_u64(id).unwrap().encode(buf);
-    let size = crate::proto::frame::varint_size(value.into_inner());
+    let size = super::frame::varint_size(value.into_inner());
     VarInt::from_u64(size as u64).unwrap().encode(buf);
     value.encode(buf);
 }

@@ -26,10 +26,7 @@ use tracing::debug;
 
 use quinn_proto::{Chunk, Dir, Side, StreamEvent, StreamId, VarInt};
 
-use crate::{
-    config::Config,
-    proto::{self, ConnectionError, Event, SendDatagramError},
-};
+use crate::proto::{self, Config, ConnectionError, Event, SendDatagramError};
 
 /// Errors from writing to a [`SendStream`]
 #[derive(Debug, Clone, Error, PartialEq, Eq)]

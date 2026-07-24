@@ -5,23 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "QMux (QUIC multiplexing over reliable transports) built on the quinn-proto stream state machine"
+description = "Tokio runtime for QMux (QUIC multiplexing over reliable transports) via quinn-proto"
 keywords = ["quic", "qmux", "multiplexing"]
 categories.workspace = true
 workspace = ".."
-# Depends on quinn-proto's private `unstable-qmux` feature; not ready for crates.io
 publish = false
-
-[features]
-default = ["runtime-tokio"]
-runtime-tokio = ["dep:tokio", "dep:rustc-hash"]
 
 [dependencies]
 bytes = { workspace = true }
-quinn-proto = { path = "../quinn-proto", version = "0.12", default-features = false, features = ["unstable-qmux"] }
-rustc-hash = { workspace = true, optional = true }
+quinn-proto = { path = "../quinn-proto", version = "0.12", default-features = false }
+rustc-hash = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync", "rt", "time", "io-util", "macros"], optional = true }
+tokio = { workspace = true, features = ["sync", "rt", "time", "io-util", "macros"] }
 tracing = { workspace = true }
 
 [dev-dependencies]

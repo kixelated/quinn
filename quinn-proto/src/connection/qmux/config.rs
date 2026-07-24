@@ -1,8 +1,6 @@
 //! Connection configuration
 
-use std::time::Duration;
-
-use quinn_proto::VarInt;
+use crate::{Duration, VarInt};
 
 /// Parameters governing a QMux connection
 ///
@@ -31,8 +29,7 @@ impl Default for Config {
             max_concurrent_uni_streams: VarInt::from_u32(100),
             send_window: 8 * 1024 * 1024,
             max_idle_timeout: Some(Duration::from_secs(30)),
-            max_record_size: VarInt::from_u64(crate::proto::params::DEFAULT_MAX_RECORD_SIZE)
-                .unwrap(),
+            max_record_size: VarInt::from_u64(super::params::DEFAULT_MAX_RECORD_SIZE).unwrap(),
             max_datagram_frame_size: Some(VarInt::from_u32(16382)),
             datagram_send_queue: 1024,
             datagram_recv_queue: 1024,

@@ -451,17 +451,12 @@ impl EcnCounts {
     }
 }
 
-#[allow(unnameable_types, unreachable_pub)] // fuzzing/qmux only
 #[derive(Debug, Clone)]
-pub struct Stream {
-    #[allow(unreachable_pub)] // fuzzing/qmux only
-    pub id: StreamId,
-    #[allow(unreachable_pub)] // fuzzing/qmux only
-    pub offset: u64,
-    #[allow(unreachable_pub)] // fuzzing/qmux only
-    pub fin: bool,
-    #[allow(unreachable_pub)] // fuzzing/qmux only
-    pub data: Bytes,
+pub(crate) struct Stream {
+    pub(crate) id: StreamId,
+    pub(crate) offset: u64,
+    pub(crate) fin: bool,
+    pub(crate) data: Bytes,
 }
 
 impl FrameStruct for Stream {
@@ -469,15 +464,11 @@ impl FrameStruct for Stream {
 }
 
 /// Metadata from a stream frame
-#[allow(unnameable_types, unreachable_pub)] // fuzzing/qmux only
 #[derive(Debug, Clone)]
-pub struct StreamMeta {
-    #[allow(unreachable_pub)] // fuzzing/qmux only
-    pub id: StreamId,
-    #[allow(unreachable_pub)] // fuzzing/qmux only
-    pub offsets: Range<u64>,
-    #[allow(unreachable_pub)] // fuzzing/qmux only
-    pub fin: bool,
+pub(crate) struct StreamMeta {
+    pub(crate) id: StreamId,
+    pub(crate) offsets: Range<u64>,
+    pub(crate) fin: bool,
 }
 
 // This manual implementation exists because `Default` is not implemented for `StreamId`
@@ -515,8 +506,7 @@ impl StreamMeta {
 }
 
 /// A vector of [`StreamMeta`] with optimization for the single element case
-#[allow(unreachable_pub)] // fuzzing/qmux only
-pub type StreamMetaVec = TinyVec<[StreamMeta; 1]>;
+pub(crate) type StreamMetaVec = TinyVec<[StreamMeta; 1]>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Crypto {
@@ -835,16 +825,13 @@ impl Iterator for AckIter<'_> {
     }
 }
 
-#[allow(unreachable_pub)] // fuzzing/qmux only
+#[allow(unreachable_pub)] // fuzzing only
 #[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
 #[derive(Debug, Copy, Clone)]
 pub struct ResetStream {
-    #[allow(unreachable_pub)] // fuzzing/qmux only
-    pub id: StreamId,
-    #[allow(unreachable_pub)] // fuzzing/qmux only
-    pub error_code: VarInt,
-    #[allow(unreachable_pub)] // fuzzing/qmux only
-    pub final_offset: VarInt,
+    pub(crate) id: StreamId,
+    pub(crate) error_code: VarInt,
+    pub(crate) final_offset: VarInt,
 }
 
 impl FrameStruct for ResetStream {

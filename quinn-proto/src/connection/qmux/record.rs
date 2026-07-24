@@ -3,8 +3,8 @@
 //! On a byte-stream transport, frames are carried in records: a variable-length integer
 //! `Size` followed by `Size` bytes of frames. A frame never spans records.
 
+use crate::{TransportError, TransportErrorCode, VarInt, coding::Codec};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use quinn_proto::{TransportError, TransportErrorCode, VarInt, coding::Codec};
 
 /// Incremental parser splitting a byte stream into records
 #[derive(Debug, Default)]
@@ -46,7 +46,7 @@ impl Deframer {
 /// Prefix an assembled frames buffer with its record Size field
 pub(crate) fn wrap(frames: &[u8]) -> Bytes {
     let size = VarInt::from_u64(frames.len() as u64).expect("record too large");
-    let prefix = crate::proto::frame::varint_size(frames.len() as u64);
+    let prefix = super::frame::varint_size(frames.len() as u64);
     let mut record = BytesMut::with_capacity(prefix + frames.len());
     size.encode(&mut record);
     record.put_slice(frames);

@@ -5,7 +5,7 @@
 //! an unresponsive peer alive indefinitely. QX_PING requests are scheduled at a third of
 //! the idle timeout.
 
-use std::time::{Duration, Instant};
+use crate::{Duration, Instant};
 
 #[derive(Debug)]
 pub(crate) struct IdleTimer {

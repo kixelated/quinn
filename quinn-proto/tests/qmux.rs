@@ -6,11 +6,10 @@ use std::{
 };
 
 use bytes::Bytes;
-use quinn_proto::coding::Codec;
-use quinn_qmux::{
-    Config, ConnectionError, Dir, Event, SendDatagramError, StreamEvent, StreamId,
-    TransportErrorCode, VarInt,
-    proto::{Connection, WriteError},
+use quinn_proto::{
+    Dir, Side, StreamEvent, StreamId, TransportErrorCode, VarInt,
+    coding::Codec,
+    qmux::{Config, Connection, ConnectionError, Event, SendDatagramError, WriteError},
 };
 
 struct Pair {
@@ -23,8 +22,8 @@ impl Pair {
     fn new(client_config: Config, server_config: Config) -> Self {
         let now = Instant::now();
         Self {
-            client: Connection::new(Arc::new(client_config), quinn_qmux::Side::Client, now),
-            server: Connection::new(Arc::new(server_config), quinn_qmux::Side::Server, now),
+            client: Connection::new(Arc::new(client_config), Side::Client, now),
+            server: Connection::new(Arc::new(server_config), Side::Server, now),
             now,
         }
     }
@@ -74,7 +73,7 @@ fn read_all(conn: &mut Connection, id: StreamId) -> (Vec<u8>, bool) {
                 fin = true;
                 break;
             }
-            Err(quinn_qmux::proto::ReadError::Blocked) => break,
+            Err(quinn_proto::qmux::ReadError::Blocked) => break,
             Err(e) => panic!("read failed: {e}"),
         }
     }

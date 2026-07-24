@@ -1,7 +1,7 @@
 # quinn-qmux
 
-An implementation of [QMux] (draft-ietf-quic-qmux-02) built on quinn-proto's stream state
-machine.
+Tokio runtime for [QMux] (draft-ietf-quic-qmux-02), whose protocol logic lives in
+`quinn_proto::qmux`.
 
 QMux brings QUIC's multiplexed streams, flow control, and datagrams to reliable, ordered
 transports such as TCP, TLS, UNIX sockets, and WebSockets. It lets applications built for
@@ -16,9 +16,9 @@ flow control uses the QUIC v1 transport parameters, and "references to acknowled
 interpreted as though acknowledgment occurs as soon as data is passed to the underlying
 transport."
 
-This crate takes that literally. `quinn_proto::StreamsState` — the engine behind quinn's
-streams, flow control, stream limits, and priority-aware fair scheduling — is driven
-unmodified via quinn-proto's internal `unstable-qmux` feature:
+The `qmux` module in quinn-proto takes that literally. `StreamsState` — the engine behind
+quinn's streams, flow control, stream limits, and priority-aware fair scheduling — is
+driven unmodified:
 
 - Incoming STREAM / RESET_STREAM / STOP_SENDING / MAX_* frames are fed to the same
   `received_*` entry points quinn's own `Connection` uses.
@@ -27,18 +27,20 @@ unmodified via quinn-proto's internal `unstable-qmux` feature:
   handing data to the transport *is* the acknowledgment. Nothing is ever retransmitted at
   this layer, and send buffers free as soon as data is serialized.
 
-What remains is the genuinely QMux-specific ~1k lines: record framing, the
-`QX_TRANSPORT_PARAMETERS` handshake, `QX_PING` keep-alives, transport parameter
-validation, reliable datagrams, in-order offset enforcement, and record-based idle timeout
-semantics.
+Because the module lives inside quinn-proto's `connection` module tree, it uses the
+existing internals as-is; the change to preexisting quinn-proto code is just the module
+registration. What the module adds is the genuinely QMux-specific ~1k lines: record
+framing, the `QX_TRANSPORT_PARAMETERS` handshake, `QX_PING` keep-alives, transport
+parameter validation, reliable datagrams, in-order offset enforcement, and record-based
+idle timeout semantics.
 
 ## Layout
 
-- `proto::Connection` — sans-IO state machine, mirroring `quinn_proto::Connection`
-  (`handle_input` / `poll_transmit` / `poll_timeout` / `handle_timeout` / `poll`).
-- `Session`, `SendStream`, `RecvStream` — tokio layer (default `runtime-tokio` feature)
-  over any `AsyncRead + AsyncWrite` transport, following the `quinn` crate's driver/waker
-  design.
+- `quinn_proto::qmux::Connection` — sans-IO state machine, mirroring
+  `quinn_proto::Connection` (`handle_input` / `poll_transmit` / `poll_timeout` /
+  `handle_timeout` / `poll`). Re-exported here as `quinn_qmux::proto`.
+- `Session`, `SendStream`, `RecvStream` (this crate) — tokio layer over any
+  `AsyncRead + AsyncWrite` transport, following the `quinn` crate's driver/waker design.
 
 Transport adapters (TLS, WebSocket), ALPN negotiation, and older draft versions are out of
 scope here; they layer on top, e.g. in [moq-dev/web-transport].
