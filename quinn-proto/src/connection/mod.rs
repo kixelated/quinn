@@ -64,6 +64,8 @@ mod paths;
 pub use paths::RttEstimator;
 use paths::{PathData, PathResponses};
 
+pub mod qmux;
+
 pub(crate) mod qlog;
 
 mod send_buffer;

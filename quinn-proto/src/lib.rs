@@ -43,6 +43,7 @@ mod bloom_token_log;
 pub use bloom_token_log::BloomTokenLog;
 
 mod connection;
+pub use crate::connection::qmux;
 pub use crate::connection::{
     Chunk, Chunks, ClosedStream, Connection, ConnectionError, ConnectionStats, Datagrams, Event,
     FinishError, FrameStats, PathStats, ReadError, ReadableError, RecvStream, RttEstimator,

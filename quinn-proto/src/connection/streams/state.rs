@@ -396,6 +396,21 @@ impl StreamsState {
         })
     }
 
+    /// Offset immediately following the stream data received so far on `id`
+    ///
+    /// [`None`] if `id` cannot currently receive data, e.g. because the stream is closed
+    /// or is a locally-initiated unidirectional stream. Used by the qmux module, where the
+    /// ordered transport makes receipt at any other offset a protocol violation.
+    pub(in crate::connection) fn rx_offset(&self, id: StreamId) -> Option<u64> {
+        let recv = self.recv.get(&id)?;
+        Some(
+            recv.as_ref()
+                .and_then(|r| r.as_open_recv())
+                // Present but unopened: the peer may send on it, starting at offset 0
+                .map_or(0, |r| r.end),
+        )
+    }
+
     /// Whether MAX_STREAM_DATA frames could be sent for stream `id`
     pub(crate) fn can_send_flow_control(&self, id: StreamId) -> bool {
         self.recv
