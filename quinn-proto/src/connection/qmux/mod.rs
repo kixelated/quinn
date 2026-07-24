@@ -434,7 +434,7 @@ impl Connection {
         let Some(peer) = &self.peer_params else {
             return Err(SendDatagramError::NotYetReady);
         };
-        let Some(max_frame) = peer.max_datagram_frame_size else {
+        let Some(max_frame) = peer.tp.max_datagram_frame_size else {
             return Err(SendDatagramError::UnsupportedByPeer);
         };
         let datagram = Datagram { data };
@@ -461,7 +461,7 @@ impl Connection {
     /// the peer disabled datagrams
     pub fn max_datagram_size(&self) -> Option<usize> {
         let peer = self.peer_params.as_ref()?;
-        let max_frame = peer.max_datagram_frame_size?;
+        let max_frame = peer.tp.max_datagram_frame_size?;
         let capacity = max_frame
             .into_inner()
             .min(peer.max_record_size.into_inner());
@@ -476,15 +476,18 @@ impl Connection {
             .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX))
             .unwrap_or(0);
         QmuxParams {
-            max_idle_timeout: VarInt::from_u64(idle_ms).unwrap_or(VarInt::MAX),
-            initial_max_data: self.config.receive_window,
-            initial_max_stream_data_bidi_local: self.config.stream_receive_window,
-            initial_max_stream_data_bidi_remote: self.config.stream_receive_window,
-            initial_max_stream_data_uni: self.config.stream_receive_window,
-            initial_max_streams_bidi: self.config.max_concurrent_bidi_streams,
-            initial_max_streams_uni: self.config.max_concurrent_uni_streams,
+            tp: TransportParameters {
+                max_idle_timeout: VarInt::from_u64(idle_ms).unwrap_or(VarInt::MAX),
+                initial_max_data: self.config.receive_window,
+                initial_max_stream_data_bidi_local: self.config.stream_receive_window,
+                initial_max_stream_data_bidi_remote: self.config.stream_receive_window,
+                initial_max_stream_data_uni: self.config.stream_receive_window,
+                initial_max_streams_bidi: self.config.max_concurrent_bidi_streams,
+                initial_max_streams_uni: self.config.max_concurrent_uni_streams,
+                max_datagram_frame_size: self.config.max_datagram_frame_size,
+                ..TransportParameters::default()
+            },
             max_record_size: self.config.max_record_size,
-            max_datagram_frame_size: self.config.max_datagram_frame_size,
         }
     }
 
@@ -517,19 +520,10 @@ impl Connection {
 
         let frame = match frame {
             QmuxFrame::TransportParameters(blob) => {
-                let peer = QmuxParams::decode(blob)?;
-                let tp = TransportParameters {
-                    initial_max_data: peer.initial_max_data,
-                    initial_max_stream_data_bidi_local: peer.initial_max_stream_data_bidi_local,
-                    initial_max_stream_data_bidi_remote: peer.initial_max_stream_data_bidi_remote,
-                    initial_max_stream_data_uni: peer.initial_max_stream_data_uni,
-                    initial_max_streams_bidi: peer.initial_max_streams_bidi,
-                    initial_max_streams_uni: peer.initial_max_streams_uni,
-                    ..TransportParameters::default()
-                };
-                self.streams.set_params(&tp);
+                let peer = QmuxParams::decode(self.side, blob)?;
+                self.streams.set_params(&peer.tp);
                 self.idle
-                    .set_peer_timeout(peer.max_idle_timeout.into_inner(), now);
+                    .set_peer_timeout(peer.tp.max_idle_timeout.into_inner(), now);
                 self.peer_params = Some(peer);
                 self.params_received = true;
                 self.events.push_back(Event::Connected);

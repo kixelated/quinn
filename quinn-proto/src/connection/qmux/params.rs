@@ -1,23 +1,21 @@
 //! QMux transport parameters (draft-ietf-quic-qmux-02 §4)
 //!
-//! Carried in the QX_TRANSPORT_PARAMETERS frame rather than a TLS extension. Only the
-//! flow-control related QUIC v1 parameters are permitted, plus the QMux-specific
-//! `max_record_size` and negotiated extensions; the remaining QUIC v1 parameters are
-//! prohibited and produce a `TRANSPORT_PARAMETER_ERROR`.
+//! Carried in the QX_TRANSPORT_PARAMETERS frame rather than a TLS extension. The wire
+//! format and the standard parameters are QUIC v1's, so encoding and decoding delegate to
+//! [`TransportParameters`]; this module adds only the QMux policy: an allow-list that hard
+//! rejects the QUIC v1 parameters the draft prohibits, duplicate detection across all
+//! parameter ids, and the QMux-specific `max_record_size` parameter, which the shared
+//! codec would otherwise ignore as unknown.
 
 use std::collections::HashSet;
 
-use crate::{TransportError, TransportErrorCode, VarInt, coding::Codec};
 use bytes::{Buf, BufMut, Bytes};
 
-const MAX_IDLE_TIMEOUT: u64 = 0x01;
-const INITIAL_MAX_DATA: u64 = 0x04;
-const INITIAL_MAX_STREAM_DATA_BIDI_LOCAL: u64 = 0x05;
-const INITIAL_MAX_STREAM_DATA_BIDI_REMOTE: u64 = 0x06;
-const INITIAL_MAX_STREAM_DATA_UNI: u64 = 0x07;
-const INITIAL_MAX_STREAMS_BIDI: u64 = 0x08;
-const INITIAL_MAX_STREAMS_UNI: u64 = 0x09;
-const MAX_DATAGRAM_FRAME_SIZE: u64 = 0x20;
+use crate::{
+    Side, TransportError, TransportErrorCode, VarInt, coding::Codec,
+    transport_parameters::TransportParameters,
+};
+
 const MAX_RECORD_SIZE: u64 = 0x0571c59429cd0845;
 
 /// Default and minimum value of `max_record_size` (16 KiB minus a 2-byte size prefix)
@@ -33,99 +31,50 @@ fn is_forbidden(id: u64) -> bool {
 }
 
 /// The transport parameters QMux endpoints exchange
-///
-/// Zero-valued parameters are omitted on the wire; `max_record_size` is omitted when it
-/// equals the default.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QmuxParams {
-    /// Milliseconds; 0 disables the idle timeout
-    pub(crate) max_idle_timeout: VarInt,
-    pub(crate) initial_max_data: VarInt,
-    pub(crate) initial_max_stream_data_bidi_local: VarInt,
-    pub(crate) initial_max_stream_data_bidi_remote: VarInt,
-    pub(crate) initial_max_stream_data_uni: VarInt,
-    pub(crate) initial_max_streams_bidi: VarInt,
-    pub(crate) initial_max_streams_uni: VarInt,
-    /// Largest Size field the peer may use in records it sends to us
+    /// The standard QUIC parameters (flow control, stream limits, idle timeout, datagrams)
+    pub(crate) tp: TransportParameters,
+    /// Largest record Size field the peer may use in records it sends to us
     pub(crate) max_record_size: VarInt,
-    /// None disables datagram support
-    pub(crate) max_datagram_frame_size: Option<VarInt>,
-}
-
-impl Default for QmuxParams {
-    fn default() -> Self {
-        Self {
-            max_idle_timeout: VarInt::from_u32(0),
-            initial_max_data: VarInt::from_u32(0),
-            initial_max_stream_data_bidi_local: VarInt::from_u32(0),
-            initial_max_stream_data_bidi_remote: VarInt::from_u32(0),
-            initial_max_stream_data_uni: VarInt::from_u32(0),
-            initial_max_streams_bidi: VarInt::from_u32(0),
-            initial_max_streams_uni: VarInt::from_u32(0),
-            max_record_size: VarInt::from_u64(DEFAULT_MAX_RECORD_SIZE).unwrap(),
-            max_datagram_frame_size: None,
-        }
-    }
 }
 
 fn err(reason: &str) -> TransportError {
     TransportError::new(TransportErrorCode::TRANSPORT_PARAMETER_ERROR, reason.into())
 }
 
-fn write_param<B: BufMut>(buf: &mut B, id: u64, value: VarInt) {
-    VarInt::from_u64(id).unwrap().encode(buf);
-    VarInt::from_u64(value.size() as u64).unwrap().encode(buf);
-    value.encode(buf);
-}
-
 impl QmuxParams {
     pub(crate) fn encode<B: BufMut>(&self, buf: &mut B) {
-        let varints = [
-            (MAX_IDLE_TIMEOUT, self.max_idle_timeout),
-            (INITIAL_MAX_DATA, self.initial_max_data),
-            (
-                INITIAL_MAX_STREAM_DATA_BIDI_LOCAL,
-                self.initial_max_stream_data_bidi_local,
-            ),
-            (
-                INITIAL_MAX_STREAM_DATA_BIDI_REMOTE,
-                self.initial_max_stream_data_bidi_remote,
-            ),
-            (
-                INITIAL_MAX_STREAM_DATA_UNI,
-                self.initial_max_stream_data_uni,
-            ),
-            (INITIAL_MAX_STREAMS_BIDI, self.initial_max_streams_bidi),
-            (INITIAL_MAX_STREAMS_UNI, self.initial_max_streams_uni),
-        ];
-        for (id, value) in varints {
-            if value.into_inner() != 0 {
-                write_param(buf, id, value);
-            }
-        }
+        self.tp.write(buf);
         if self.max_record_size.into_inner() != DEFAULT_MAX_RECORD_SIZE {
-            write_param(buf, MAX_RECORD_SIZE, self.max_record_size);
-        }
-        if let Some(size) = self.max_datagram_frame_size {
-            write_param(buf, MAX_DATAGRAM_FRAME_SIZE, size);
+            VarInt::from_u64(MAX_RECORD_SIZE).unwrap().encode(buf);
+            VarInt::from_u64(self.max_record_size.size() as u64)
+                .unwrap()
+                .encode(buf);
+            self.max_record_size.encode(buf);
         }
     }
 
-    pub(crate) fn decode(mut buf: Bytes) -> Result<Self, TransportError> {
-        let mut params = Self::default();
+    pub(crate) fn decode(side: Side, blob: Bytes) -> Result<Self, TransportError> {
+        // QMux-specific validation pass: enforce the allow-list and duplicate rules over
+        // every parameter (the shared codec cannot see prohibited-with-default-value,
+        // duplicated-unknown, or QMux-only parameters), and pluck out max_record_size
+        let mut max_record_size = VarInt::from_u64(DEFAULT_MAX_RECORD_SIZE).unwrap();
         let mut seen = HashSet::new();
-        while buf.has_remaining() {
-            let id = VarInt::decode(&mut buf)
+        let mut scan = &blob[..];
+        while scan.has_remaining() {
+            let id = VarInt::decode(&mut scan)
                 .map_err(|_| err("truncated parameter id"))?
                 .into_inner();
-            let len = VarInt::decode(&mut buf)
+            let len = VarInt::decode(&mut scan)
                 .map_err(|_| err("truncated parameter length"))?
                 .into_inner();
             let len = usize::try_from(len).map_err(|_| err("oversized parameter"))?;
-            if buf.remaining() < len {
+            if scan.remaining() < len {
                 return Err(err("truncated parameter value"));
             }
-            let mut value = buf.split_to(len);
+            let mut value = &scan[..len];
+            scan.advance(len);
 
             if is_forbidden(id) {
                 return Err(err("prohibited QUIC v1 transport parameter"));
@@ -133,43 +82,24 @@ impl QmuxParams {
             if !seen.insert(id) {
                 return Err(err("duplicate transport parameter"));
             }
-
-            let field = match id {
-                MAX_IDLE_TIMEOUT => &mut params.max_idle_timeout,
-                INITIAL_MAX_DATA => &mut params.initial_max_data,
-                INITIAL_MAX_STREAM_DATA_BIDI_LOCAL => {
-                    &mut params.initial_max_stream_data_bidi_local
+            if id == MAX_RECORD_SIZE {
+                max_record_size =
+                    VarInt::decode(&mut value).map_err(|_| err("malformed parameter value"))?;
+                if value.has_remaining() {
+                    return Err(err("malformed parameter value"));
                 }
-                INITIAL_MAX_STREAM_DATA_BIDI_REMOTE => {
-                    &mut params.initial_max_stream_data_bidi_remote
-                }
-                INITIAL_MAX_STREAM_DATA_UNI => &mut params.initial_max_stream_data_uni,
-                INITIAL_MAX_STREAMS_BIDI => &mut params.initial_max_streams_bidi,
-                INITIAL_MAX_STREAMS_UNI => &mut params.initial_max_streams_uni,
-                MAX_RECORD_SIZE => &mut params.max_record_size,
-                MAX_DATAGRAM_FRAME_SIZE => {
-                    params.max_datagram_frame_size = Some(decode_value(&mut value)?);
-                    continue;
-                }
-                // Unknown parameters (including grease) are ignored
-                _ => continue,
-            };
-            *field = decode_value(&mut value)?;
+            }
         }
-
-        if params.max_record_size.into_inner() < DEFAULT_MAX_RECORD_SIZE {
+        if max_record_size.into_inner() < DEFAULT_MAX_RECORD_SIZE {
             return Err(err("max_record_size below the required minimum"));
         }
 
-        Ok(params)
-    }
-}
-
-fn decode_value(value: &mut Bytes) -> Result<VarInt, TransportError> {
-    let x = VarInt::decode(value).map_err(|_| err("malformed parameter value"))?;
-    match value.has_remaining() {
-        true => Err(err("malformed parameter value")),
-        false => Ok(x),
+        // The standard parameters are parsed by the shared codec
+        let tp = TransportParameters::read(side, &mut &blob[..])?;
+        Ok(Self {
+            tp,
+            max_record_size,
+        })
     }
 }
 
@@ -177,32 +107,52 @@ fn decode_value(value: &mut Bytes) -> Result<VarInt, TransportError> {
 mod tests {
     use super::*;
 
+    fn params(max_record_size: u32) -> QmuxParams {
+        QmuxParams {
+            tp: TransportParameters {
+                max_idle_timeout: VarInt::from_u32(30_000),
+                initial_max_data: VarInt::from_u32(1 << 20),
+                initial_max_stream_data_bidi_local: VarInt::from_u32(1 << 16),
+                initial_max_stream_data_bidi_remote: VarInt::from_u32(1 << 16),
+                initial_max_stream_data_uni: VarInt::from_u32(1 << 16),
+                initial_max_streams_bidi: VarInt::from_u32(16),
+                initial_max_streams_uni: VarInt::from_u32(16),
+                max_datagram_frame_size: Some(VarInt::from_u32(4096)),
+                ..TransportParameters::default()
+            },
+            max_record_size: VarInt::from_u32(max_record_size),
+        }
+    }
+
+    fn write_param(buf: &mut Vec<u8>, id: u64, value: VarInt) {
+        VarInt::from_u64(id).unwrap().encode(buf);
+        VarInt::from_u64(value.size() as u64).unwrap().encode(buf);
+        value.encode(buf);
+    }
+
     #[test]
     fn round_trip() {
-        let params = QmuxParams {
-            max_idle_timeout: VarInt::from_u32(30_000),
-            initial_max_data: VarInt::from_u32(1 << 20),
-            initial_max_stream_data_bidi_local: VarInt::from_u32(1 << 16),
-            initial_max_stream_data_bidi_remote: VarInt::from_u32(1 << 16),
-            initial_max_stream_data_uni: VarInt::from_u32(1 << 16),
-            initial_max_streams_bidi: VarInt::from_u32(16),
-            initial_max_streams_uni: VarInt::from_u32(16),
-            max_record_size: VarInt::from_u32(32_768),
-            max_datagram_frame_size: Some(VarInt::from_u32(4096)),
-        };
+        let params = params(32_768);
         let mut buf = Vec::new();
         params.encode(&mut buf);
-        assert_eq!(QmuxParams::decode(buf.into()).unwrap(), params);
+        assert_eq!(
+            QmuxParams::decode(Side::Server, buf.into()).unwrap(),
+            params
+        );
     }
 
     #[test]
     fn defaults_encode_empty() {
+        let defaults = QmuxParams {
+            tp: TransportParameters::default(),
+            max_record_size: VarInt::from_u64(DEFAULT_MAX_RECORD_SIZE).unwrap(),
+        };
         let mut buf = Vec::new();
-        QmuxParams::default().encode(&mut buf);
+        defaults.encode(&mut buf);
         assert!(buf.is_empty());
         assert_eq!(
-            QmuxParams::decode(Bytes::new()).unwrap(),
-            QmuxParams::default()
+            QmuxParams::decode(Side::Client, Bytes::new()).unwrap(),
+            defaults
         );
     }
 
@@ -210,30 +160,47 @@ mod tests {
     fn forbidden_param() {
         // stateless_reset_token (0x02)
         let buf: &[u8] = &[0x02, 0x00];
-        assert!(QmuxParams::decode(Bytes::copy_from_slice(buf)).is_err());
+        assert!(QmuxParams::decode(Side::Client, Bytes::copy_from_slice(buf)).is_err());
     }
 
     #[test]
     fn duplicate_param() {
         let mut buf = Vec::new();
-        write_param(&mut buf, INITIAL_MAX_DATA, VarInt::from_u32(1));
-        write_param(&mut buf, INITIAL_MAX_DATA, VarInt::from_u32(1));
-        assert!(QmuxParams::decode(buf.into()).is_err());
+        write_param(&mut buf, 0x04, VarInt::from_u32(1)); // initial_max_data
+        write_param(&mut buf, 0x04, VarInt::from_u32(1));
+        assert!(QmuxParams::decode(Side::Client, buf.into()).is_err());
+    }
+
+    #[test]
+    fn duplicate_unknown_param() {
+        // The shared codec skips unknown ids, so only the QMux scan can catch this
+        let mut buf = Vec::new();
+        write_param(&mut buf, 0x1234, VarInt::from_u32(7));
+        write_param(&mut buf, 0x1234, VarInt::from_u32(7));
+        assert!(QmuxParams::decode(Side::Client, buf.into()).is_err());
     }
 
     #[test]
     fn unknown_param_ignored() {
         let mut buf = Vec::new();
         write_param(&mut buf, 0x1234, VarInt::from_u32(7));
-        write_param(&mut buf, INITIAL_MAX_DATA, VarInt::from_u32(42));
-        let params = QmuxParams::decode(buf.into()).unwrap();
-        assert_eq!(params.initial_max_data, VarInt::from_u32(42));
+        write_param(&mut buf, 0x04, VarInt::from_u32(42)); // initial_max_data
+        let params = QmuxParams::decode(Side::Client, buf.into()).unwrap();
+        assert_eq!(params.tp.initial_max_data, VarInt::from_u32(42));
     }
 
     #[test]
     fn record_size_below_minimum() {
         let mut buf = Vec::new();
         write_param(&mut buf, MAX_RECORD_SIZE, VarInt::from_u32(1024));
-        assert!(QmuxParams::decode(buf.into()).is_err());
+        assert!(QmuxParams::decode(Side::Client, buf.into()).is_err());
+    }
+
+    #[test]
+    fn oversized_stream_limit_rejected() {
+        // MAX_STREAM_COUNT enforcement comes from the shared codec
+        let mut buf = Vec::new();
+        write_param(&mut buf, 0x08, VarInt::from_u64(1 << 61).unwrap());
+        assert!(QmuxParams::decode(Side::Client, buf.into()).is_err());
     }
 }
