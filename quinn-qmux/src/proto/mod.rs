@@ -24,12 +24,17 @@ use thiserror::Error;
 use tracing::trace;
 
 use quinn_proto::{
-    Dir, RecvStream, SendStream, Side, StreamEvent, StreamId, Streams, TransportError,
-    TransportErrorCode, VarInt,
+    Dir, Side, StreamEvent, StreamId, TransportError, TransportErrorCode, VarInt,
     qmux_internal::{
         ConnectionState, FrameStats, Retransmits, StreamsState, ThinRetransmits,
         stream_transport_parameters,
     },
+};
+
+// The poll-level stream API is quinn-proto's, re-exported for sans-IO users
+pub use quinn_proto::{
+    Chunks, ClosedStream, FinishError, ReadError, ReadableError, RecvStream, SendStream, Streams,
+    WriteError, Written,
 };
 
 use crate::config::Config;

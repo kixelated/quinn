@@ -26,10 +26,11 @@ pub mod proto;
 mod config;
 pub use config::Config;
 
-// Re-export the quinn-proto vocabulary types that appear in this crate's API
+// Re-export the quinn-proto vocabulary types that appear in this crate's API. The
+// poll-level stream types (Chunks, WriteError, ...) live in `proto`, since the async
+// layer wraps them with its own error types.
 pub use quinn_proto::{
-    Chunk, Chunks, ClosedStream, Dir, FinishError, ReadError, ReadableError, Side, StreamEvent,
-    StreamId, TransportError, TransportErrorCode, VarInt, WriteError, Written,
+    Chunk, Dir, Side, StreamEvent, StreamId, TransportError, TransportErrorCode, VarInt,
 };
 
 pub use proto::{ConnectionError, Event, SendDatagramError};
@@ -37,4 +38,4 @@ pub use proto::{ConnectionError, Event, SendDatagramError};
 #[cfg(feature = "runtime-tokio")]
 mod runtime;
 #[cfg(feature = "runtime-tokio")]
-pub use runtime::{RecvStream, SendStream, Session};
+pub use runtime::{ReadError, RecvStream, SendStream, Session, WriteError};

@@ -21,7 +21,7 @@ bytes = { workspace = true }
 quinn-proto = { path = "../quinn-proto", version = "0.12", default-features = false, features = ["unstable-qmux"] }
 rustc-hash = { workspace = true, optional = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync", "rt", "time", "io-util"], optional = true }
+tokio = { workspace = true, features = ["sync", "rt", "time", "io-util", "macros"], optional = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

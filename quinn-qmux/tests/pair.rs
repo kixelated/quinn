@@ -9,8 +9,8 @@ use bytes::Bytes;
 use quinn_proto::coding::Codec;
 use quinn_qmux::{
     Config, ConnectionError, Dir, Event, SendDatagramError, StreamEvent, StreamId,
-    TransportErrorCode, VarInt, WriteError,
-    proto::Connection,
+    TransportErrorCode, VarInt,
+    proto::{Connection, WriteError},
 };
 
 struct Pair {
@@ -74,7 +74,7 @@ fn read_all(conn: &mut Connection, id: StreamId) -> (Vec<u8>, bool) {
                 fin = true;
                 break;
             }
-            Err(quinn_qmux::ReadError::Blocked) => break,
+            Err(quinn_qmux::proto::ReadError::Blocked) => break,
             Err(e) => panic!("read failed: {e}"),
         }
     }
