@@ -725,6 +725,14 @@ impl Iter {
     fn take_remaining(&mut self) -> Bytes {
         mem::take(&mut self.bytes)
     }
+
+    /// Extract the unparsed remainder of the payload
+    ///
+    /// Allows the qmux module to interleave QMux extension frames, which this iterator
+    /// does not recognize, with standard QUIC frames parsed one at a time.
+    pub(crate) fn into_rest(self) -> Bytes {
+        self.bytes
+    }
 }
 
 impl Iterator for Iter {

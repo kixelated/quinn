@@ -27,7 +27,9 @@ use super::{
     streams::StreamsState,
 };
 use crate::{
-    Dir, Instant, Side, StreamId, TransportError, TransportErrorCode, VarInt,
+    ApplicationClose, ConnectionClose, Dir, Instant, Side, StreamId, TransportError,
+    TransportErrorCode, VarInt,
+    frame::{Close, Datagram, Frame},
     transport_parameters::TransportParameters,
 };
 
@@ -40,15 +42,15 @@ pub use crate::{
 mod config;
 pub use config::Config;
 
-mod frame;
 mod params;
 mod record;
 mod timer;
+mod wire;
 
-use frame::{Close, Frame};
 use params::QmuxParams;
 use record::Deframer;
 use timer::IdleTimer;
+use wire::QmuxFrame;
 
 /// Events yielded by [`Connection::poll`]
 #[derive(Debug)]
@@ -73,23 +75,11 @@ pub enum ConnectionError {
     #[error("transport error: {0}")]
     TransportError(#[from] TransportError),
     /// The peer's transport layer closed the connection
-    #[error("closed by peer: code {}", error_code.into_inner())]
-    ConnectionClosed {
-        /// Error code supplied by the peer
-        error_code: VarInt,
-        /// Type of the frame that provoked the closure, if any
-        frame_type: Option<VarInt>,
-        /// Peer-supplied reason
-        reason: Bytes,
-    },
+    #[error("closed by peer: {0}")]
+    ConnectionClosed(ConnectionClose),
     /// The peer's application closed the connection
-    #[error("closed by peer application: code {}", error_code.into_inner())]
-    ApplicationClosed {
-        /// Application-supplied error code
-        error_code: VarInt,
-        /// Application-supplied reason
-        reason: Bytes,
-    },
+    #[error("closed by peer application: {0}")]
+    ApplicationClosed(ApplicationClose),
     /// The idle timeout expired
     #[error("timed out")]
     TimedOut,
@@ -139,7 +129,7 @@ pub struct Connection {
     ping_request_pending: bool,
     ping_responses: VecDeque<VarInt>,
 
-    datagram_send: VecDeque<Bytes>,
+    datagram_send: VecDeque<Datagram>,
     datagram_recv: VecDeque<Bytes>,
 
     /// CONNECTION_CLOSE / APPLICATION_CLOSE frame awaiting transmission
@@ -238,7 +228,7 @@ impl Connection {
         let payload_len = payload.len();
         let mut buf = payload;
         loop {
-            let frame = match Frame::decode(&mut buf) {
+            let frame = match wire::next_frame(&mut buf) {
                 Ok(Some(frame)) => frame,
                 Ok(None) => break,
                 Err(e) => return Err(self.fail(e)),
@@ -268,12 +258,7 @@ impl Connection {
         if self.is_closed() {
             return;
         }
-        self.close = Some(Close {
-            is_application: true,
-            error_code,
-            frame_type: None,
-            reason,
-        });
+        self.close = Some(Close::Application(ApplicationClose { error_code, reason }));
         self.lost(ConnectionError::LocallyClosed);
     }
 
@@ -298,12 +283,13 @@ impl Connection {
             return None;
         }
         let mut buf = Vec::new();
+        let budget = self.record_budget();
 
         // The transport parameters must be the very first frame we send
         if !self.params_sent {
             let mut blob = Vec::new();
             self.local_params().encode(&mut blob);
-            frame::encode_transport_parameters(&mut buf, &blob);
+            wire::encode_transport_parameters(&mut buf, &blob);
             self.params_sent = true;
         }
 
@@ -317,35 +303,33 @@ impl Connection {
                     false => Some(buf),
                 };
             };
-            frame::encode_close(&mut buf, &close);
+            close.encode(&mut buf, budget);
             self.close_sent = true;
             self.idle.on_record_sent(now);
             return Some(buf);
         }
 
-        let budget = self.record_budget();
-
         while let Some(&seq) = self.ping_responses.front() {
-            if buf.len() + frame::ping_size(seq) > budget {
+            if buf.len() + wire::ping_size(seq) > budget {
                 break;
             }
-            frame::encode_ping(&mut buf, true, seq);
+            wire::encode_ping(&mut buf, true, seq);
             self.ping_responses.pop_front();
         }
         if self.ping_request_pending {
             let seq = VarInt::from_u64(self.next_ping_seq).expect("ping sequence overflow");
-            if buf.len() + frame::ping_size(seq) <= budget {
-                frame::encode_ping(&mut buf, false, seq);
+            if buf.len() + wire::ping_size(seq) <= budget {
+                wire::encode_ping(&mut buf, false, seq);
                 self.next_ping_seq += 1;
                 self.ping_request_pending = false;
             }
         }
 
         while let Some(datagram) = self.datagram_send.front() {
-            if buf.len() + frame::datagram_frame_size(datagram.len()) > budget {
+            if buf.len() + datagram.size(true) > budget {
                 break;
             }
-            frame::encode_datagram(&mut buf, datagram);
+            datagram.encode(true, &mut buf);
             self.datagram_send.pop_front();
         }
 
@@ -453,8 +437,8 @@ impl Connection {
         let Some(max_frame) = peer.max_datagram_frame_size else {
             return Err(SendDatagramError::UnsupportedByPeer);
         };
-        let size = frame::datagram_frame_size(data.len()) as u64;
-        if size
+        let datagram = Datagram { data };
+        if datagram.size(true) as u64
             > max_frame
                 .into_inner()
                 .min(peer.max_record_size.into_inner())
@@ -464,7 +448,7 @@ impl Connection {
         if self.datagram_send.len() >= self.config.datagram_send_queue {
             self.datagram_send.pop_front();
         }
-        self.datagram_send.push_back(data);
+        self.datagram_send.push_back(datagram);
         Ok(())
     }
 
@@ -516,12 +500,12 @@ impl Connection {
 
     fn on_frame(
         &mut self,
-        frame: Frame,
+        frame: QmuxFrame,
         payload_len: usize,
         now: Instant,
     ) -> Result<(), TransportError> {
         // QX_TRANSPORT_PARAMETERS must be the first frame received, exactly once
-        if self.params_received == matches!(frame, Frame::TransportParameters(_)) {
+        if self.params_received == matches!(frame, QmuxFrame::TransportParameters(_)) {
             return Err(TransportError::new(
                 TransportErrorCode::PROTOCOL_VIOLATION,
                 match self.params_received {
@@ -531,8 +515,8 @@ impl Connection {
             ));
         }
 
-        match frame {
-            Frame::TransportParameters(blob) => {
+        let frame = match frame {
+            QmuxFrame::TransportParameters(blob) => {
                 let peer = QmuxParams::decode(blob)?;
                 let tp = TransportParameters {
                     initial_max_data: peer.initial_max_data,
@@ -554,7 +538,48 @@ impl Connection {
                     self.events
                         .push_back(Event::Stream(StreamEvent::Available { dir }));
                 }
+                return Ok(());
             }
+            QmuxFrame::PingRequest(seq) => {
+                let seq = seq.into_inner();
+                if self
+                    .greatest_ping_recv
+                    .is_some_and(|greatest| seq <= greatest)
+                {
+                    return Err(TransportError::new(
+                        TransportErrorCode::PROTOCOL_VIOLATION,
+                        "QX_PING sequence number did not increase".into(),
+                    ));
+                }
+                self.greatest_ping_recv = Some(seq);
+                self.ping_responses
+                    .push_back(VarInt::from_u64(seq).expect("validated varint"));
+                return Ok(());
+            }
+            QmuxFrame::PingResponse(seq) => {
+                if seq.into_inner() >= self.next_ping_seq {
+                    return Err(TransportError::new(
+                        TransportErrorCode::PROTOCOL_VIOLATION,
+                        "QX_PING response for a request we never sent".into(),
+                    ));
+                }
+                return Ok(());
+            }
+            QmuxFrame::ResetStreamAt(reset) => {
+                // On a reliable transport all stream data was already delivered to us, so
+                // the partial-delivery guarantee is trivially satisfied; treat as a reset
+                self.recv_offsets.remove(&reset.id);
+                let transmit = self.streams.received_reset(reset)?;
+                if transmit.should_transmit() {
+                    self.pending.max_data = true;
+                }
+                return Ok(());
+            }
+            QmuxFrame::Quic(frame) => frame,
+        };
+
+        match frame {
+            Frame::Padding => {}
             Frame::Stream(stream) => {
                 // The draft requires stream payloads to arrive in offset order; a gap can
                 // only mean a peer bug, since the transport is ordered. Data on a stream
@@ -584,61 +609,39 @@ impl Connection {
                     self.pending.max_data = true;
                 }
             }
-            Frame::ResetStreamAt(reset) => {
-                // On a reliable transport all stream data was already delivered to us, so
-                // the partial-delivery guarantee is trivially satisfied; treat as a reset
-                self.recv_offsets.remove(&reset.id);
-                let transmit = self.streams.received_reset(reset)?;
-                if transmit.should_transmit() {
-                    self.pending.max_data = true;
-                }
-            }
-            Frame::StopSending { id, error_code } => {
-                self.streams.received_stop_sending(id, error_code);
+            Frame::StopSending(stop) => {
+                self.streams.received_stop_sending(stop.id, stop.error_code);
             }
             Frame::MaxData(max) => self.streams.received_max_data(max),
             Frame::MaxStreamData { id, offset } => {
-                self.streams
-                    .received_max_stream_data(id, offset.into_inner())?;
+                self.streams.received_max_stream_data(id, offset)?;
             }
             Frame::MaxStreams { dir, count } => {
-                self.streams.received_max_streams(dir, count.into_inner())?;
+                self.streams.received_max_streams(dir, count)?;
             }
             Frame::DataBlocked { offset } => {
-                trace!(offset = offset.into_inner(), "peer reports DATA_BLOCKED");
+                trace!(offset, "peer reports DATA_BLOCKED");
             }
             Frame::StreamDataBlocked { id, offset } => {
-                trace!(stream = %id, offset = offset.into_inner(), "peer reports STREAM_DATA_BLOCKED");
+                trace!(stream = %id, offset, "peer reports STREAM_DATA_BLOCKED");
             }
             Frame::StreamsBlocked { dir, limit } => {
-                trace!(
-                    ?dir,
-                    limit = limit.into_inner(),
-                    "peer reports STREAMS_BLOCKED"
-                );
+                trace!(?dir, limit, "peer reports STREAMS_BLOCKED");
             }
-            Frame::Close(close) => {
-                let reason = match close.is_application {
-                    true => ConnectionError::ApplicationClosed {
-                        error_code: close.error_code,
-                        reason: close.reason,
-                    },
-                    false => ConnectionError::ConnectionClosed {
-                        error_code: close.error_code,
-                        frame_type: close.frame_type,
-                        reason: close.reason,
-                    },
-                };
-                self.lost(reason);
+            Frame::Close(Close::Application(close)) => {
+                self.lost(ConnectionError::ApplicationClosed(close));
             }
-            Frame::Datagram(data) => {
+            Frame::Close(Close::Connection(close)) => {
+                self.lost(ConnectionError::ConnectionClosed(close));
+            }
+            Frame::Datagram(datagram) => {
                 let Some(max_frame) = self.config.max_datagram_frame_size else {
                     return Err(TransportError::new(
                         TransportErrorCode::PROTOCOL_VIOLATION,
                         "DATAGRAM frame received but datagrams are disabled".into(),
                     ));
                 };
-                if frame::datagram_frame_size(data.len()) as u64 > max_frame.into_inner() {
+                if datagram.size(true) as u64 > max_frame.into_inner() {
                     return Err(TransportError::new(
                         TransportErrorCode::PROTOCOL_VIOLATION,
                         "oversized DATAGRAM frame".into(),
@@ -648,31 +651,18 @@ impl Connection {
                 if self.datagram_recv.len() >= self.config.datagram_recv_queue {
                     self.datagram_recv.pop_front();
                 }
-                self.datagram_recv.push_back(data);
+                self.datagram_recv.push_back(datagram.data);
                 self.events.push_back(Event::DatagramReceived);
             }
-            Frame::PingRequest(seq) => {
-                let seq = seq.into_inner();
-                if self
-                    .greatest_ping_recv
-                    .is_some_and(|greatest| seq <= greatest)
-                {
-                    return Err(TransportError::new(
-                        TransportErrorCode::PROTOCOL_VIOLATION,
-                        "QX_PING sequence number did not increase".into(),
-                    ));
-                }
-                self.greatest_ping_recv = Some(seq);
-                self.ping_responses
-                    .push_back(VarInt::from_u64(seq).expect("validated varint"));
-            }
-            Frame::PingResponse(seq) => {
-                if seq.into_inner() >= self.next_ping_seq {
-                    return Err(TransportError::new(
-                        TransportErrorCode::PROTOCOL_VIOLATION,
-                        "QX_PING response for a request we never sent".into(),
-                    ));
-                }
+            // The QUIC frames QMux prohibits: ACK, PING, CRYPTO, NEW_TOKEN, connection ID
+            // and path management, ACK_FREQUENCY, IMMEDIATE_ACK, HANDSHAKE_DONE
+            frame => {
+                let mut err = TransportError::new(
+                    TransportErrorCode::FRAME_ENCODING_ERROR,
+                    "frame type prohibited in QMux".into(),
+                );
+                err.frame = Some(frame.ty());
+                return Err(err);
             }
         }
         Ok(())
@@ -682,12 +672,7 @@ impl Connection {
     fn fail(&mut self, error: TransportError) -> ConnectionError {
         let reason = ConnectionError::TransportError(error.clone());
         if self.error.is_none() {
-            self.close = Some(Close {
-                is_application: false,
-                error_code: VarInt::from_u64(error.code.into()).unwrap_or(VarInt::MAX),
-                frame_type: None,
-                reason: error.reason.clone().into(),
-            });
+            self.close = Some(Close::from(error));
             self.lost(reason.clone());
         }
         reason

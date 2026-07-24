@@ -320,9 +320,9 @@ fn application_close() {
         Some(ConnectionError::LocallyClosed)
     ));
     match pair.server.error() {
-        Some(ConnectionError::ApplicationClosed { error_code, reason }) => {
-            assert_eq!(*error_code, VarInt::from_u32(3));
-            assert_eq!(reason.as_ref(), b"bye");
+        Some(ConnectionError::ApplicationClosed(close)) => {
+            assert_eq!(close.error_code, VarInt::from_u32(3));
+            assert_eq!(close.reason.as_ref(), b"bye");
         }
         other => panic!("unexpected server error: {other:?}"),
     }

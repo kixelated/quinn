@@ -65,10 +65,7 @@ async fn large_uni_transfer_with_backpressure() {
     );
     assert_eq!(received.len(), expected.len());
     assert_eq!(received, expected);
-    assert!(matches!(
-        send_result,
-        ConnectionError::ApplicationClosed { .. }
-    ));
+    assert!(matches!(send_result, ConnectionError::ApplicationClosed(_)));
 }
 
 #[tokio::test]
@@ -86,9 +83,9 @@ async fn close_reaches_peer() {
     let (client, server) = pair(Config::default(), Config::default()).await;
     client.close(VarInt::from_u32(7), Bytes::from_static(b"goodbye"));
     match server.closed().await {
-        ConnectionError::ApplicationClosed { error_code, reason } => {
-            assert_eq!(error_code, VarInt::from_u32(7));
-            assert_eq!(reason.as_ref(), b"goodbye");
+        ConnectionError::ApplicationClosed(close) => {
+            assert_eq!(close.error_code, VarInt::from_u32(7));
+            assert_eq!(close.reason.as_ref(), b"goodbye");
         }
         other => panic!("unexpected close reason: {other:?}"),
     }
@@ -100,7 +97,7 @@ async fn drop_closes() {
     drop(client);
     assert!(matches!(
         server.closed().await,
-        ConnectionError::ApplicationClosed { error_code, .. } if error_code == VarInt::from_u32(0)
+        ConnectionError::ApplicationClosed(close) if close.error_code == VarInt::from_u32(0)
     ));
 }
 

@@ -74,8 +74,7 @@ fn err(reason: &str) -> TransportError {
 
 fn write_param<B: BufMut>(buf: &mut B, id: u64, value: VarInt) {
     VarInt::from_u64(id).unwrap().encode(buf);
-    let size = super::frame::varint_size(value.into_inner());
-    VarInt::from_u64(size as u64).unwrap().encode(buf);
+    VarInt::from_u64(value.size() as u64).unwrap().encode(buf);
     value.encode(buf);
 }
 

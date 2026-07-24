@@ -46,8 +46,7 @@ impl Deframer {
 /// Prefix an assembled frames buffer with its record Size field
 pub(crate) fn wrap(frames: &[u8]) -> Bytes {
     let size = VarInt::from_u64(frames.len() as u64).expect("record too large");
-    let prefix = super::frame::varint_size(frames.len() as u64);
-    let mut record = BytesMut::with_capacity(prefix + frames.len());
+    let mut record = BytesMut::with_capacity(size.size() + frames.len());
     size.encode(&mut record);
     record.put_slice(frames);
     record.freeze()
