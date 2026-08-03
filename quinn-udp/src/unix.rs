@@ -16,7 +16,7 @@ use socket2::SockRef;
 
 use super::{
     EcnCodepoint, IO_ERROR_LOG_INTERVAL, RecvMeta, Transmit, TransportError, UdpSockRef, cmsg,
-    log_sendmsg_error,
+    is_fatal_send_error, log_sendmsg_error,
 };
 
 #[cfg(apple_fast)]
@@ -211,14 +211,14 @@ impl UdpSocketState {
 
     /// Sends a [`Transmit`] on the given socket
     ///
-    /// This function will only ever return errors of kind [`io::ErrorKind::WouldBlock`].
-    /// All other errors will be logged and converted to `Ok`.
+    /// This function returns errors of kind [`io::ErrorKind::WouldBlock`], and errors for which
+    /// [`is_fatal_send_error`] holds. All other errors will be logged and converted to `Ok`.
     ///
-    /// UDP transmission errors are considered non-fatal because higher-level protocols must
+    /// Most UDP transmission errors are considered non-fatal because higher-level protocols must
     /// employ retransmits and timeouts anyway in order to deal with UDP's unreliable nature.
     /// Thus, logging is most likely the only thing you can do with these errors.
     ///
-    /// If you would like to handle these errors yourself, use [`UdpSocketState::try_send`]
+    /// If you would like to handle all errors yourself, use [`UdpSocketState::try_send`]
     /// instead.
     pub fn send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
         match send(self, socket.0, transmit) {
@@ -227,6 +227,9 @@ impl UdpSocketState {
             // - EMSGSIZE is expected for MTU probes. Future work might be able to avoid
             //   these by automatically clamping the MTUD upper bound to the interface MTU.
             Err(e) if e.raw_os_error() == Some(libc::EMSGSIZE) => Ok(()),
+            // The destination is unreachable no matter how often we retry, so let the caller
+            // react to that rather than silently dropping the datagram.
+            Err(e) if is_fatal_send_error(&e) => Err(e),
             Err(e) => {
                 log_sendmsg_error(&self.last_send_error, e, transmit);
 

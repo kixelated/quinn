@@ -224,6 +224,30 @@ pub enum TransportErrorPayload {
     Other,
 }
 
+/// Whether a send error means the datagram can never be delivered as addressed
+///
+/// Most errors reported by a UDP send are transient: the network may recover, or the error may
+/// have been provoked by an unrelated earlier datagram. Retransmission is therefore the right
+/// response, and [`UdpSocketState::send`] hides them from the caller.
+///
+/// The errors matched here are different. They are produced by the local network stack when it
+/// has no way to reach the destination at all -- no route to the address, or the network
+/// interface is down. Retrying cannot fix them, so [`UdpSocketState::send`] surfaces them and
+/// lets the caller decide, e.g. to fail a connection attempt promptly and retry over a
+/// different address family rather than wait for an idle timeout.
+///
+/// Note that these conditions are only reliably local when the socket is unconnected, as
+/// [`UdpSocketState`] expects. A `connect`ed socket may report [`HostUnreachable`] on the basis
+/// of a received ICMP message, which an off-path attacker can forge.
+///
+/// [`HostUnreachable`]: std::io::ErrorKind::HostUnreachable
+pub fn is_fatal_send_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    // These map from ENETUNREACH/EHOSTUNREACH/ENETDOWN on Unix and the corresponding
+    // WSAE* codes on Windows.
+    matches!(e.kind(), NetworkUnreachable | HostUnreachable | NetworkDown)
+}
+
 /// Log at most 1 IO error per minute
 #[cfg(not(wasm_browser))]
 const IO_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
@@ -318,6 +342,30 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::*;
+
+    /// The classifier works off `io::ErrorKind`, so check that the platform's raw error codes
+    /// actually map onto the kinds we expect.
+    #[cfg(unix)]
+    #[test]
+    fn fatal_send_errors() {
+        for errno in [libc::ENETUNREACH, libc::EHOSTUNREACH, libc::ENETDOWN] {
+            let e = std::io::Error::from_raw_os_error(errno);
+            assert!(is_fatal_send_error(&e), "{e} should be fatal");
+        }
+
+        // Transient or otherwise recoverable, and so still hidden from the caller
+        for errno in [
+            libc::EMSGSIZE,
+            libc::ECONNREFUSED,
+            libc::EAGAIN,
+            libc::EINVAL,
+            libc::EIO,
+            libc::EPERM,
+        ] {
+            let e = std::io::Error::from_raw_os_error(errno);
+            assert!(!is_fatal_send_error(&e), "{e} should not be fatal");
+        }
+    }
 
     #[test]
     fn effective_segment_size() {
