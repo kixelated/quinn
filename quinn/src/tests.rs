@@ -700,7 +700,7 @@ async fn fatal_send_error_fails_connection() {
     let crate::ConnectionError::TransportError(err) = err else {
         panic!("expected a transport error, got {err}");
     };
-    assert_eq!(err.code, crate::TransportErrorCode::NETWORK_UNREACHABLE);
+    assert_eq!(err.code, crate::TransportErrorCode::NO_VIABLE_PATH);
 }
 
 /// Wraps a socket so that every transmit fails as though the peer had no route

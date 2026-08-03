@@ -253,8 +253,10 @@ impl Future for ConnectionDriver {
             // there's no route to the peer. Tear the connection down so that everything waiting on
             // it learns immediately, rather than blocking until the idle timeout expires.
             Err(e) => {
-                let reason =
-                    TransportError::new(TransportErrorCode::NETWORK_UNREACHABLE, e.to_string());
+                // NO_VIABLE_PATH is the registered code for exactly this condition, and nothing
+                // else in quinn produces it, so applications can match on it to tell "the peer is
+                // unreachable from here" apart from any other reason a connection failed.
+                let reason = TransportError::new(TransportErrorCode::NO_VIABLE_PATH, e.to_string());
                 conn.terminate(ConnectionError::TransportError(reason), &self.0.shared);
                 return Poll::Ready(Err(e));
             }

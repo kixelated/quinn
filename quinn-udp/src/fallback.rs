@@ -28,8 +28,9 @@ impl UdpSocketState {
 
     /// Sends a [`Transmit`] on the given socket.
     ///
-    /// This function returns errors of kind [`io::ErrorKind::WouldBlock`], and errors for which
-    /// [`is_fatal_send_error`] holds. All other errors will be logged and converted to `Ok`.
+    /// This function returns errors of kind [`io::ErrorKind::WouldBlock`], along with errors
+    /// meaning the destination can never be reached as addressed -- there is no route to it, or
+    /// the local network is down. All other errors will be logged and converted to `Ok`.
     ///
     /// Most UDP transmission errors are considered non-fatal because higher-level protocols must
     /// employ retransmits and timeouts anyway in order to deal with UDP's unreliable nature.

@@ -241,7 +241,7 @@ pub enum TransportErrorPayload {
 /// of a received ICMP message, which an off-path attacker can forge.
 ///
 /// [`HostUnreachable`]: std::io::ErrorKind::HostUnreachable
-pub fn is_fatal_send_error(e: &std::io::Error) -> bool {
+pub(crate) fn is_fatal_send_error(e: &std::io::Error) -> bool {
     use std::io::ErrorKind::*;
     // These map from ENETUNREACH/EHOSTUNREACH/ENETDOWN on Unix and the corresponding
     // WSAE* codes on Windows.
