@@ -689,9 +689,10 @@ async fn fatal_send_error_fails_connection() {
         .connect_with(client_config, server, "localhost")
         .unwrap();
 
-    // The default idle timeout is far longer than this, so a timeout here means the error was
-    // swallowed and we fell back to waiting.
-    let err = timeout(Duration::from_secs(5), connecting)
+    // Failing the connection doesn't wait on the network, so this only needs to be long enough to
+    // tolerate a loaded machine. Timing out here means the error was swallowed and we fell back to
+    // waiting for the idle timeout, which is orders of magnitude longer.
+    let err = timeout(Duration::from_millis(500), connecting)
         .await
         .expect("connection attempt did not resolve promptly")
         .expect_err("connection succeeded despite every transmit failing");
