@@ -697,10 +697,10 @@ async fn fatal_send_error_fails_connection() {
         .expect("connection attempt did not resolve promptly")
         .expect_err("connection succeeded despite every transmit failing");
 
-    assert_eq!(
-        err,
-        crate::ConnectionError::TransmitFailed(io::ErrorKind::NetworkUnreachable)
-    );
+    let crate::ConnectionError::TransportError(err) = err else {
+        panic!("expected a transport error, got {err}");
+    };
+    assert_eq!(err.code, crate::TransportErrorCode::NETWORK_UNREACHABLE);
 }
 
 /// Wraps a socket so that every transmit fails as though the peer had no route

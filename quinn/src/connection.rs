@@ -253,7 +253,9 @@ impl Future for ConnectionDriver {
             // there's no route to the peer. Tear the connection down so that everything waiting on
             // it learns immediately, rather than blocking until the idle timeout expires.
             Err(e) => {
-                conn.terminate(ConnectionError::TransmitFailed(e.kind()), &self.0.shared);
+                let reason =
+                    TransportError::new(TransportErrorCode::NETWORK_UNREACHABLE, e.to_string());
+                conn.terminate(ConnectionError::TransportError(reason), &self.0.shared);
                 return Poll::Ready(Err(e));
             }
         };

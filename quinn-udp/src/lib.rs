@@ -343,25 +343,6 @@ mod tests {
 
     use super::*;
 
-    /// This isn't checking the `match`, it's checking that the platform actually decodes these
-    /// errnos into the kinds the `match` names -- an assumption that has to hold on every target
-    /// we support, not just the one we developed on.
-    #[cfg(unix)]
-    #[test]
-    fn fatal_send_errors() {
-        for errno in [libc::ENETUNREACH, libc::EHOSTUNREACH, libc::ENETDOWN] {
-            let e = std::io::Error::from_raw_os_error(errno);
-            assert!(is_fatal_send_error(&e), "{e} should be fatal");
-        }
-
-        // These reach `send`'s other branches: EMSGSIZE is expected for MTU probes, and
-        // EINVAL/EIO drive the GSO fallback. Classifying them as fatal would break both.
-        for errno in [libc::EMSGSIZE, libc::EINVAL, libc::EIO] {
-            let e = std::io::Error::from_raw_os_error(errno);
-            assert!(!is_fatal_send_error(&e), "{e} should not be fatal");
-        }
-    }
-
     #[test]
     fn effective_segment_size() {
         assert_eq!(

@@ -142,4 +142,9 @@ errors! {
     KEY_UPDATE_ERROR(0xE) "key update error";
     AEAD_LIMIT_REACHED(0xF) "the endpoint has reached the confidentiality or integrity limit for the AEAD algorithm";
     NO_VIABLE_PATH(0x10) "no viable network path exists";
+    // Local-only. Reported when the platform refuses a transmit outright, e.g. because there is
+    // no route to the peer or the network is down. Deliberately far outside the range of
+    // registered QUIC transport error codes: this is never serialized, because the
+    // CONNECTION_CLOSE that a local failure triggers carries an application error code instead.
+    NETWORK_UNREACHABLE(0x1_0000_0000) "the local network stack cannot reach the peer";
 }
