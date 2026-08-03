@@ -188,15 +188,15 @@ impl UdpSocketState {
 
     /// Sends a [`Transmit`] on the given socket.
     ///
-    /// This function returns errors of kind [`io::ErrorKind::WouldBlock`], along with errors
-    /// meaning the destination can never be reached as addressed -- there is no route to it, or
-    /// the local network is down. All other errors will be logged and converted to `Ok`.
+    /// This function will only ever return errors of kind [`io::ErrorKind::WouldBlock`], or
+    /// errors indicating that the destination is unreachable. All other errors will be logged
+    /// and converted to `Ok`.
     ///
-    /// Most UDP transmission errors are considered non-fatal because higher-level protocols must
+    /// UDP transmission errors are considered non-fatal because higher-level protocols must
     /// employ retransmits and timeouts anyway in order to deal with UDP's unreliable nature.
     /// Thus, logging is most likely the only thing you can do with these errors.
     ///
-    /// If you would like to handle all errors yourself, use [`UdpSocketState::try_send`]
+    /// If you would like to handle these errors yourself, use [`UdpSocketState::try_send`]
     /// instead.
     pub fn send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
         match send(
