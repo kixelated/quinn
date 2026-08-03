@@ -10,7 +10,7 @@ use std::{
     future::Future,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
-    pin::pin,
+    pin::{Pin, pin},
     str,
     sync::{
         Arc,
@@ -19,7 +19,7 @@ use std::{
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
-use crate::runtime::TokioRuntime;
+use crate::runtime::{Runtime as _, TokioRuntime};
 use crate::{Duration, Instant};
 use bytes::Bytes;
 use proto::{RandomConnectionIdGenerator, crypto::rustls::QuicClientConfig};
@@ -655,6 +655,87 @@ fn gen_data(size: usize, seed: u64) -> Vec<u8> {
     let mut buf = vec![0; size];
     rng.fill_bytes(&mut buf);
     buf
+}
+
+/// A fatal send error should fail the connection attempt rather than stall it until the timeout
+///
+/// `quinn_udp` reports errors like `ENETUNREACH` because no amount of retransmission will make the
+/// peer reachable. Applications rely on seeing them promptly, e.g. to retry over a different
+/// address family.
+#[tokio::test]
+async fn fatal_send_error_fails_connection() {
+    let _guard = subscribe();
+
+    let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+    let runtime = Arc::new(TokioRuntime);
+    let socket = UnreachableSocket(runtime.wrap_udp_socket(socket).unwrap());
+
+    let endpoint = Endpoint::new_with_abstract_socket(
+        EndpointConfig::default(),
+        None,
+        Box::new(socket),
+        runtime,
+    )
+    .unwrap();
+
+    // Any reachable-looking address will do; the socket fails every transmit regardless.
+    let server = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let mut roots = RootCertStore::empty();
+    roots.add(cert.cert.into()).unwrap();
+    let client_config = ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+
+    let connecting = endpoint
+        .connect_with(client_config, server, "localhost")
+        .unwrap();
+
+    // The default idle timeout is far longer than this, so a timeout here means the error was
+    // swallowed and we fell back to waiting.
+    let err = timeout(Duration::from_secs(5), connecting)
+        .await
+        .expect("connection attempt did not resolve promptly")
+        .expect_err("connection succeeded despite every transmit failing");
+
+    assert_eq!(
+        err,
+        crate::ConnectionError::TransmitFailed(io::ErrorKind::NetworkUnreachable)
+    );
+}
+
+/// Wraps a socket so that every transmit fails as though the peer had no route
+#[derive(Debug)]
+struct UnreachableSocket(Box<dyn crate::AsyncUdpSocket>);
+
+impl crate::AsyncUdpSocket for UnreachableSocket {
+    fn create_sender(&self) -> Pin<Box<dyn crate::UdpSender>> {
+        Box::pin(UnreachableSender)
+    }
+
+    fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &mut [io::IoSliceMut<'_>],
+        meta: &mut [udp::RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        self.0.poll_recv(cx, bufs, meta)
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.0.local_addr()
+    }
+}
+
+#[derive(Debug)]
+struct UnreachableSender;
+
+impl crate::UdpSender for UnreachableSender {
+    fn poll_send(
+        self: Pin<&mut Self>,
+        _transmit: &udp::Transmit<'_>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(Err(io::Error::from(io::ErrorKind::NetworkUnreachable)))
+    }
 }
 
 fn subscribe() -> tracing::subscriber::DefaultGuard {
