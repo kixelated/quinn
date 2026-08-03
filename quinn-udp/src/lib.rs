@@ -224,6 +224,30 @@ pub enum TransportErrorPayload {
     Other,
 }
 
+/// Whether a send error means the datagram can never be delivered as addressed
+///
+/// Most errors reported by a UDP send are transient: the network may recover, or the error may
+/// have been provoked by an unrelated earlier datagram. Retransmission is therefore the right
+/// response, and [`UdpSocketState::send`] hides them from the caller.
+///
+/// The errors matched here are different. They are produced by the local network stack when it
+/// has no way to reach the destination at all -- no route to the address, or the network
+/// interface is down. Retrying cannot fix them, so [`UdpSocketState::send`] surfaces them and
+/// lets the caller decide, e.g. to fail a connection attempt promptly and retry over a
+/// different address family rather than wait for an idle timeout.
+///
+/// Note that these conditions are only reliably local when the socket is unconnected, as
+/// [`UdpSocketState`] expects. A `connect`ed socket may report [`HostUnreachable`] on the basis
+/// of a received ICMP message, which an off-path attacker can forge.
+///
+/// [`HostUnreachable`]: std::io::ErrorKind::HostUnreachable
+pub(crate) fn is_fatal_send_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    // These map from ENETUNREACH/EHOSTUNREACH/ENETDOWN on Unix and the corresponding
+    // WSAE* codes on Windows.
+    matches!(e.kind(), NetworkUnreachable | HostUnreachable | NetworkDown)
+}
+
 /// Log at most 1 IO error per minute
 #[cfg(not(wasm_browser))]
 const IO_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);

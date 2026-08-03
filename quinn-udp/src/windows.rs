@@ -17,6 +17,7 @@ use windows_sys::Win32::Networking::WinSock;
 use crate::{
     EcnCodepoint, IO_ERROR_LOG_INTERVAL, RecvMeta, Transmit, UdpSockRef,
     cmsg::{self, CMsgHdr},
+    is_fatal_send_error,
     log::debug,
     log_sendmsg_error,
 };
@@ -187,8 +188,9 @@ impl UdpSocketState {
 
     /// Sends a [`Transmit`] on the given socket.
     ///
-    /// This function will only ever return errors of kind [`io::ErrorKind::WouldBlock`].
-    /// All other errors will be logged and converted to `Ok`.
+    /// This function will only ever return errors of kind [`io::ErrorKind::WouldBlock`], or
+    /// errors indicating that the destination is unreachable. All other errors will be logged
+    /// and converted to `Ok`.
     ///
     /// UDP transmission errors are considered non-fatal because higher-level protocols must
     /// employ retransmits and timeouts anyway in order to deal with UDP's unreliable nature.
@@ -205,6 +207,9 @@ impl UdpSocketState {
         ) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
+            // The destination is unreachable no matter how often we retry, so let the caller
+            // react to that rather than silently dropping the datagram.
+            Err(e) if is_fatal_send_error(&e) => Err(e),
             Err(e) => {
                 log_sendmsg_error(&self.last_send_error, e, transmit);
 

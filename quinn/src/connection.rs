@@ -247,7 +247,20 @@ impl Future for ConnectionDriver {
             conn.terminate(e, &self.0.shared);
             return Poll::Ready(Ok(()));
         }
-        let mut keep_going = conn.drive_transmit(cx)?;
+        let mut keep_going = match conn.drive_transmit(cx) {
+            Ok(keep_going) => keep_going,
+            // The socket rejected a transmit in a way that retransmission won't fix, e.g. because
+            // there's no route to the peer. Tear the connection down so that everything waiting on
+            // it learns immediately, rather than blocking until the idle timeout expires.
+            Err(e) => {
+                // NO_VIABLE_PATH is the registered code for exactly this condition, and nothing
+                // else in quinn produces it, so applications can match on it to tell "the peer is
+                // unreachable from here" apart from any other reason a connection failed.
+                let reason = TransportError::new(TransportErrorCode::NO_VIABLE_PATH, e.to_string());
+                conn.terminate(ConnectionError::TransportError(reason), &self.0.shared);
+                return Poll::Ready(Err(e));
+            }
+        };
         // If a timer expires, there might be more to transmit. When we transmit something, we
         // might need to reset a timer. Hence, we must loop until neither happens.
         keep_going |= conn.drive_timer(cx);
@@ -1272,14 +1285,28 @@ impl State {
     }
 
     fn close(&mut self, error_code: VarInt, reason: Bytes, shared: &Shared) {
+        self.close_with(error_code, reason, ConnectionError::LocallyClosed, shared);
+    }
+
+    /// Close the connection, reporting `cause` to everything waiting on it
+    fn close_with(
+        &mut self,
+        error_code: VarInt,
+        reason: Bytes,
+        cause: ConnectionError,
+        shared: &Shared,
+    ) {
         self.inner.close(self.runtime.now(), error_code, reason);
-        self.terminate(ConnectionError::LocallyClosed, shared);
+        self.terminate(cause, shared);
         self.wake();
     }
 
     /// Close for a reason other than the application's explicit request
     pub(crate) fn implicit_close(&mut self, shared: &Shared) {
-        self.close(0u32.into(), Bytes::new(), shared);
+        // If the connection has already failed, that explains its fate better than the implicit
+        // close we're performing now because the last handle went away.
+        let cause = self.error.clone().unwrap_or(ConnectionError::LocallyClosed);
+        self.close_with(0u32.into(), Bytes::new(), cause, shared);
     }
 
     pub(crate) fn check_0rtt(&self) -> Result<(), ()> {
